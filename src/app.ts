@@ -48,6 +48,7 @@ import userConversionsRouter from "./routes/userConversions";
 import paymentRoutingRouter from "./routes/paymentRouting";
 import anchorsRouter from "./routes/anchors";
 import relayerKeysRouter from "./routes/relayerKeys";
+import yieldEmissionRouter from "./routes/yieldEmission";
 import { sendApiError } from "./lib/apiError.js";
 import metricsRouter from "./routes/metrics";
 
@@ -162,6 +163,9 @@ app.use("/api/v1/payment-routing", paymentRoutingRouter);
 // Issue #931 – Anchor SEP-24 / SEP-31 Webhook Ingestion Service
 app.use("/api/v1/anchors", anchorsRouter);
 
+// Issue #1046 – Yield Farming Token Emission Schedule Calculator
+app.use("/api/v1/yield", yieldEmissionRouter);
+
 // Issue #836 – Soroban Contract Instruction & Storage Rent Estimator
 // eslint-disable-next-line no-undef
 app.use("/api/v1/soroban/rent", sorobanRentEstimateRouter);
@@ -221,6 +225,11 @@ app.get("/", (req, res) => {
         requestQuote: "POST /api/v1/payment-routing/quotes",
         lockQuote: "POST /api/v1/payment-routing/quotes/:id/lock",
         getQuote: "GET /api/v1/payment-routing/quotes/:id",
+      },
+      yield: {
+        emissions: "/api/v1/yield/emissions",
+        emissionRate: "/api/v1/yield/emissions/rate",
+        emissionSchedule: "/api/v1/yield/emissions/schedule",
       },
     },
   });
