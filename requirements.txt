@@ -60,6 +60,9 @@ cryptography>=42.0.0
 # Async web framework for proof verification endpoints
 fastapi>=0.104.0
 
+# Structured application logging used by the FastAPI service and OpenAPI generation
+structlog>=23.1.0
+
 # Validate the checked-in OpenAPI contract in CI
 openapi-spec-validator>=0.7.1
 

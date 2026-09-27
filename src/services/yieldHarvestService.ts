@@ -27,7 +27,9 @@ export interface HarvestAnalyticsRecord {
   yieldAmount: number;
   gasCost: number;
   netProfit: number;
+  profitRatio: number;
   minimumProfit: number;
+  minimumProfitRatio: number;
   status: HarvestExecutionStatus;
   returnAmount?: number;
   transactionHash?: string;
@@ -48,6 +50,7 @@ export interface HarvestEvaluation {
 }
 
 const DEFAULT_INTERVAL_MS = 60_000;
+const DEFAULT_MINIMUM_PROFIT_RATIO = 3.0;
 
 export function createPrismaHarvestAnalyticsRepository(database: {
   harvestExecution: {
@@ -70,12 +73,19 @@ export class YieldHarvestDaemon {
     private readonly minimumProfit = Number(
       process.env.YIELD_HARVEST_MINIMUM_PROFIT ?? "0",
     ),
+    private readonly minimumProfitRatio = Number(
+      process.env.YIELD_HARVEST_MINIMUM_PROFIT_RATIO ?? 
+        String(DEFAULT_MINIMUM_PROFIT_RATIO),
+    ),
     private readonly intervalMs = Number(
       process.env.YIELD_HARVEST_INTERVAL_MS ?? DEFAULT_INTERVAL_MS,
     ),
   ) {
     if (!Number.isFinite(minimumProfit) || minimumProfit < 0) {
       throw new Error("Yield harvest minimum profit must be non-negative");
+    }
+    if (!Number.isFinite(minimumProfitRatio) || minimumProfitRatio < 0) {
+      throw new Error("Yield harvest minimum profit ratio must be non-negative");
     }
     if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
       throw new Error("Yield harvest interval must be positive");
@@ -116,15 +126,20 @@ export class YieldHarvestDaemon {
     this.validateOpportunity(opportunity);
     const evaluatedAt = new Date();
     const netProfit = opportunity.yieldAmount - opportunity.gasCost;
+    const profitRatio = opportunity.gasCost > 0 
+      ? opportunity.yieldAmount / opportunity.gasCost 
+      : Infinity;
 
-    if (netProfit <= this.minimumProfit) {
+    if (netProfit <= this.minimumProfit || profitRatio < this.minimumProfitRatio) {
       await this.analytics.recordHarvest({
         strategyId: opportunity.strategyId,
         asset: opportunity.asset,
         yieldAmount: opportunity.yieldAmount,
         gasCost: opportunity.gasCost,
         netProfit,
+        profitRatio,
         minimumProfit: this.minimumProfit,
+        minimumProfitRatio: this.minimumProfitRatio,
         status: "SKIPPED",
         evaluatedAt,
       });
@@ -144,7 +159,9 @@ export class YieldHarvestDaemon {
         yieldAmount: opportunity.yieldAmount,
         gasCost: opportunity.gasCost,
         netProfit,
+        profitRatio,
         minimumProfit: this.minimumProfit,
+        minimumProfitRatio: this.minimumProfitRatio,
         status: "EXECUTED",
         ...(result.returnAmount === undefined
           ? {}
@@ -169,7 +186,9 @@ export class YieldHarvestDaemon {
         yieldAmount: opportunity.yieldAmount,
         gasCost: opportunity.gasCost,
         netProfit,
+        profitRatio,
         minimumProfit: this.minimumProfit,
+        minimumProfitRatio: this.minimumProfitRatio,
         status: "FAILED",
         error: message,
         evaluatedAt,
@@ -195,6 +214,11 @@ export class YieldHarvestDaemon {
     ) {
       throw new Error(
         "Yield and gas cost must be finite, non-negative numbers",
+      );
+    }
+    if (opportunity.gasCost === 0 && this.minimumProfitRatio > 0) {
+      throw new Error(
+        "Gas cost cannot be zero when minimum profit ratio is configured",
       );
     }
   }

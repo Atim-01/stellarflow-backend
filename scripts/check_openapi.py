@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -129,6 +130,17 @@ def compatibility_breaks(old: dict[str, Any], new: dict[str, Any]) -> list[str]:
     return breaks
 
 
+def is_explicit_approval_enabled() -> bool:
+    return os.environ.get("OPENAPI_BREAKING_CHANGE_APPROVAL", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "approved",
+        "override",
+    }
+
+
 def load_spec(path: Path) -> dict[str, Any]:
     with path.open(encoding="utf-8") as file:
         spec = json.load(file)
@@ -140,27 +152,42 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--write", action="store_true", help="replace the checked-in OpenAPI artifact")
     parser.add_argument("--check", action="store_true", help="check formatting and backward compatibility")
+    parser.add_argument(
+        "--baseline",
+        type=Path,
+        default=SPEC_PATH,
+        help="path to the production baseline OpenAPI artifact to compare against (defaults to openapi.json)",
+    )
     args = parser.parse_args()
     if args.write == args.check:
         parser.error("choose exactly one of --write or --check")
 
+    baseline_path = args.baseline
     current = generated_spec()
     validate_spec(current)
     rendered = canonical_json(current)
     if args.write:
-        SPEC_PATH.write_text(rendered, encoding="utf-8")
+        baseline_path.parent.mkdir(parents=True, exist_ok=True)
+        baseline_path.write_text(rendered, encoding="utf-8")
         return 0
-    if not SPEC_PATH.exists():
-        print(f"Missing OpenAPI baseline: {SPEC_PATH}", file=sys.stderr)
+    if not baseline_path.exists():
+        print(f"Missing OpenAPI baseline: {baseline_path}", file=sys.stderr)
         return 1
-    baseline = load_spec(SPEC_PATH)
-    if rendered != SPEC_PATH.read_text(encoding="utf-8"):
+    baseline = load_spec(baseline_path)
+    if baseline_path == SPEC_PATH and rendered != SPEC_PATH.read_text(encoding="utf-8"):
         print("OpenAPI artifact is stale; run python scripts/check_openapi.py --write", file=sys.stderr)
         return 1
     breaks = compatibility_breaks(baseline, current)
     if breaks:
+        override_message = (
+            "Explicit approval override is enabled via OPENAPI_BREAKING_CHANGE_APPROVAL=true. "
+            "Proceeding with the breaking changes because an approver has explicitly bypassed the gate."
+            if is_explicit_approval_enabled()
+            else "Require explicit approval override via OPENAPI_BREAKING_CHANGE_APPROVAL=true before merging this PR."
+        )
         print("Incompatible OpenAPI changes detected:\n" + "\n".join(f"- {item}" for item in breaks), file=sys.stderr)
-        return 1
+        print(override_message, file=sys.stderr)
+        return 0 if is_explicit_approval_enabled() else 1
     return 0
 
 
