@@ -1300,6 +1300,23 @@ model HourlyStats {
   @@index([hour])
 }
 
+// Webhook Endpoint for Circuit Breaker Notifications
+// Stores registered third-party monitoring platform endpoints with HMAC secrets
+model WebhookEndpoint {
+  id          String   @id @default(uuid())
+  name        String   // Human-readable name for the endpoint
+  url         String   // Webhook URL to send notifications to
+  hmacSecret  String   // HMAC secret for signing payloads
+  isActive    Boolean  @default(true)
+  events      String[] // Array of event types to subscribe to (e.g., ["Pause", "CircuitBreakerTriggered"])
+  headers     String?  // Optional custom headers as JSON string
+  timeoutMs   Int      @default(1000) // Request timeout in milliseconds (default 1 second)
+  maxRetries  Int      @default(3)    // Maximum retry attempts
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([isActive])
+  @@index([url])
 // Remittance Transaction Model – Issue #815
 // Records individual remittance transactions for the /api/v1/remittance/history endpoint.
 // Supports cursor-based pagination and compound filter queries by status, asset, and date.

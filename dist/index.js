@@ -31,18 +31,8 @@ import { registerTracingShutdownHandlers } from "./utils/shutdownTracing";
 import { providerSecretRotationService } from "./services/providerSecretRotationService";
 import { priceAggregatorService } from "./services/priceAggregatorService";
 import { contractSanityCheckService } from "./services/contractSanityCheckService";
-import { getCircuitBreakerService } from "./services/circuitBreakerService";
 import { governanceTimelockService } from "./services/governanceTimelockService";
-import { getRegionalHealthService } from "./services/regionalHealthService";
 import { storageRentBumpService } from "./services/storageRentBumpService";
-import { getOrderBookSnapshotEngine } from "./services/orderBookSnapshotEngine";
-import { redisOperationsWorker } from "./services/redisOperationsWorker";
-import { initializeBridgeServices, stopBridgeServices } from "./services/bridgeIntegration";
-import { VolatilityService } from "./services/volatility.service";
-import { ArbitrageScanner } from "./services/arbitrageScanner";
-import { storageMonitorService } from "./services/storageMonitorService";
-import { complianceScreeningWorker } from "./services/complianceScreeningWorker";
-import { startDekRotationJob } from "./jobs/dekRotationJob";
 // Load environment variables
 dotenv.config();
 // Normalize safe startup environment strings before runtime storage.
