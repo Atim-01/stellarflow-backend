@@ -1,6 +1,5 @@
 import { Request, Response } from "express";
 import { orderDepthAggregatorService } from "../services/orderDepthAggregatorService";
-import { getRedisClient } from "../lib/redis";
 import { sendApiError } from "../lib/apiError";
 
 export async function getOrderDepth(req: Request, res: Response) {
@@ -11,14 +10,10 @@ export async function getOrderDepth(req: Request, res: Response) {
   }
 
   try {
-    const redis = getRedisClient();
-    const keyPrefix = process.env.ORDER_BOOK_REDIS_PREFIX ?? "orders:book";
-    const cacheKey = `${keyPrefix}:${market}:depth:cache`;
-
-    const cachedDepth = await redis?.get(cacheKey);
+    const cachedDepth = await orderDepthAggregatorService.getCachedDepth(market);
 
     if (cachedDepth) {
-      res.json({ success: true, data: JSON.parse(cachedDepth) });
+      res.json({ success: true, data: cachedDepth });
       return;
     }
 
