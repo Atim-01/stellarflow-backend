@@ -14,6 +14,7 @@ import { maintenanceMiddleware } from "./middleware/maintenanceMiddleware";
 import { rateLimitMiddleware } from "./middleware/rateLimitMiddleware";
 import { graphqlQueryGuard } from "./middleware/graphqlQueryGuard";
 import { applyHttpSecurity } from "./middleware/httpSecurity";
+import { compressionMiddleware } from "./middleware/compressionMiddleware";
 import {
   tracingMiddleware,
   axiosTracingMiddleware,
@@ -64,6 +65,9 @@ applyHttpSecurity(app);
 
 // Maintenance mode middleware: must be early in the chain
 app.use(maintenanceMiddleware);
+
+// Dynamic payload compression middleware: gzip and brotli (> 1KB threshold)
+app.use(compressionMiddleware());
 
 app.use(express.json());
 

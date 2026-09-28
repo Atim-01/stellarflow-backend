@@ -1,5 +1,4 @@
 import { createServer } from "http";
-import compression from "compression";
 import dotenv from "dotenv";
 import { Horizon } from "@stellar/stellar-sdk";
 import stellarProvider from "./lib/stellarProvider";
