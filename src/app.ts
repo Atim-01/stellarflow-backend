@@ -49,6 +49,7 @@ import userConversionsRouter from "./routes/userConversions";
 import paymentRoutingRouter from "./routes/paymentRouting";
 import anchorsRouter from "./routes/anchors";
 import relayerKeysRouter from "./routes/relayerKeys";
+import sep38Router from "./routes/sep38";
 import { sendApiError } from "./lib/apiError.js";
 import metricsRouter from "./routes/metrics";
 
@@ -165,6 +166,7 @@ app.use("/api/v1/payment-routing", paymentRoutingRouter);
 
 // Issue #931 – Anchor SEP-24 / SEP-31 Webhook Ingestion Service
 app.use("/api/v1/anchors", anchorsRouter);
+app.use("/api/v1/sep38", sep38Router);
 
 // Issue #836 – Soroban Contract Instruction & Storage Rent Estimator
 // eslint-disable-next-line no-undef
