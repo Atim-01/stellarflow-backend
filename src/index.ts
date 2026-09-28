@@ -42,7 +42,6 @@ import { governanceWebhookBroadcaster } from "./services/governanceWebhookBroadc
 import { getRegionalHealthService } from "./services/regionalHealthService";
 import { storageRentBumpService } from "./services/storageRentBumpService";
 import { getOrderBookSnapshotEngine } from "./services/orderBookSnapshotEngine";
-import { getRegionalHealthService } from "./services/regionalHealthService";
 import { redisOperationsWorker } from "./services/redisOperationsWorker";
 import { initializeBridgeServices, stopBridgeServices } from "./services/bridgeIntegration";
 import { VolatilityService } from "./services/volatility.service";
@@ -269,7 +268,7 @@ systemHealthWatchdog.registerWorker({
   name: "redis-operations",
   getLastHeartbeatAt: () => redisOperationsWorker.getLastHeartbeatAt(),
   heartbeatTimeoutMs: redisOperationsWorker.getHeartbeatTimeoutMs(),
-  restart: () => {
+  restart: async () => {
     redisOperationsWorker.stop();
     await ledgerEventStreamWorker.stop();
     redisOperationsWorker.start();
