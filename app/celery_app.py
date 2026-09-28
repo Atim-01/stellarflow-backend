@@ -2,9 +2,11 @@
 
 import os
 
-from celery import Celery
+from celery import Celery, signals
 from celery.schedules import crontab
 from kombu import Exchange, Queue
+from opentelemetry import trace
+from opentelemetry.trace import propagation
 
 init_sentry()
 
@@ -14,6 +16,26 @@ celery_app = Celery(
     backend=os.getenv("CELERY_RESULT_BACKEND", "rpc://"),
     include=["app.tasks"],
 )
+
+@signals.before_task_publish.connect
+def on_before_task_publish(sender=None, headers=None, body=None, **kwargs):
+    carrier = {}
+    propagation.inject(carrier)
+    if headers is not None:
+        headers.update(carrier)
+    elif body is not None and isinstance(body, dict):
+        body.update(carrier)
+
+@signals.task_prerun.connect
+def on_task_prerun(sender=None, headers=None, **kwargs):
+    carrier = {}
+    if headers:
+        carrier = {k: v for k, v in headers.items() if k.lower().startswith("traceparent") or k.lower() in ("tracestate", "uber-trace-id")}
+    extracted_context = propagation.extract(carrier)
+    token = trace.set_tracer_provider(trace.get_tracer_provider())
+    # Attach context via OpenTelemetry trace context propagation
+    from opentelemetry.context import attach
+    attach(extracted_context)
 
 celery_app.conf.update(
     task_serializer="json",
