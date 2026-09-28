@@ -42,7 +42,6 @@ import { governanceWebhookBroadcaster } from "./services/governanceWebhookBroadc
 import { getRegionalHealthService } from "./services/regionalHealthService";
 import { storageRentBumpService } from "./services/storageRentBumpService";
 import { getOrderBookSnapshotEngine } from "./services/orderBookSnapshotEngine";
-import { getRegionalHealthService } from "./services/regionalHealthService";
 import { redisOperationsWorker } from "./services/redisOperationsWorker";
 import { initializeBridgeServices, stopBridgeServices } from "./services/bridgeIntegration";
 import { VolatilityService } from "./services/volatility.service";
@@ -51,6 +50,7 @@ import { storageMonitorService } from "./services/storageMonitorService";
 import { complianceScreeningWorker } from "./services/complianceScreeningWorker";
 import { startDekRotationJob } from "./jobs/dekRotationJob";
 import { ledgerEventStreamWorker } from "./services/ledgerEventStreamWorker";
+import { systemicRiskMonitor } from "./services/systemicRiskWiring";
 
 // Load environment variables
 dotenv.config();
@@ -342,6 +342,7 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     apyWorker.stop();
     storageMonitorService.stop(); // <--- ADDED
     systemHealthWatchdog.stop();
+    systemicRiskMonitor.stop();
     // FIX 2: Optional chaining — safe to call even if service never started
     gasBalanceMonitorService?.stop();
     circuitBreakerService.stop();
@@ -645,6 +646,14 @@ httpServer.listen(PORT, async () => {
     ArbitrageScanner.start();
   } catch (err) {
     console.error("Failed to start arbitrage scanner:", err);
+  }
+
+  // Issue #978 – Multi-collateral vault systemic risk score engine
+  try {
+    systemicRiskMonitor.start();
+    console.log("📉 Systemic risk monitor started");
+  } catch (err) {
+    console.error("Failed to start systemic risk monitor:", err);
   }
 });
 
