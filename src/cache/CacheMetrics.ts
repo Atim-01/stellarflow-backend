@@ -2,6 +2,7 @@ import { Router } from "express";
 import { sendApiError } from "../lib/apiError.js";
 import { cacheService } from "./CacheService";
 import { CacheInvalidation } from "./CacheInvalidation";
+import { getCacheInvalidationManager } from "./CacheInvalidationManager";
 import { getRedisClient } from "../lib/redis";
 
 const router = Router();
@@ -30,10 +31,22 @@ router.get("/metrics", (req, res) => {
         redis: {
           connected: redis?.isOpen ?? false,
         },
+        invalidations: getCacheInvalidationManager().getMetrics(),
       },
     });
   } catch (error) {
-    sendApiError(res, 500, "INTERNAL_SERVER_ERROR", typeof (error instanceof Error ? error.message : "Failed to get metrics") === "string" ? String(error instanceof Error ? error.message : "Failed to get metrics") : undefined);
+    sendApiError(
+      res,
+      500,
+      "INTERNAL_SERVER_ERROR",
+      typeof (error instanceof Error
+        ? error.message
+        : "Failed to get metrics") === "string"
+        ? String(
+            error instanceof Error ? error.message : "Failed to get metrics",
+          )
+        : undefined,
+    );
   }
 });
 
@@ -57,7 +70,18 @@ router.post("/clear", async (req, res) => {
       message: "Cache cleared successfully",
     });
   } catch (error) {
-    sendApiError(res, 500, "INTERNAL_SERVER_ERROR", typeof (error instanceof Error ? error.message : "Failed to clear cache") === "string" ? String(error instanceof Error ? error.message : "Failed to clear cache") : undefined);
+    sendApiError(
+      res,
+      500,
+      "INTERNAL_SERVER_ERROR",
+      typeof (error instanceof Error
+        ? error.message
+        : "Failed to clear cache") === "string"
+        ? String(
+            error instanceof Error ? error.message : "Failed to clear cache",
+          )
+        : undefined,
+    );
   }
 });
 
@@ -99,7 +123,16 @@ router.get("/health", async (req, res) => {
       },
     });
   } catch (error) {
-    sendApiError(res, 500, "INTERNAL_SERVER_ERROR", typeof (error instanceof Error ? error.message : "Health check failed") === "string" ? String(error instanceof Error ? error.message : "Health check failed") : undefined);
+    sendApiError(
+      res,
+      500,
+      "INTERNAL_SERVER_ERROR",
+      typeof (error instanceof Error
+        ? error.message
+        : "Health check failed") === "string"
+        ? String(error instanceof Error ? error.message : "Health check failed")
+        : undefined,
+    );
   }
 });
 

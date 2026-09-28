@@ -3,7 +3,7 @@
  * zero unhandled exceptions / rejections. Emits a TypeScript release-readiness
  * report under `reports/` and fails the suite if the gate is not PASS.
  */
-import { KeyKeeper } from "../src/state/keeper";
+import { KeyKeeper } from "../../src/state/keeper";
 import { ReleaseReport, type LayerResult } from "./releaseReport";
 
 describe("Release readiness (e2e load)", () => {
@@ -67,7 +67,7 @@ describe("Release readiness (e2e load)", () => {
     expect(totalOps).toBeGreaterThan(0);
 
     // Surface the artifact path for CI logs.
-    // eslint-disable-next-line no-console
+     
     console.log(`TS release report: ${written.json} (gate=${report.gate})`);
   });
 });

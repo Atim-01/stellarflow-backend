@@ -11,6 +11,8 @@
 import { Router, Request, Response } from "express";
 import { getOhlcCandles } from "../controllers/analyticsController.js";
 import { priceAggregatorService } from "../services/priceAggregatorService.js";
+import { getLiquidityPoolAnalytics } from "../controllers/liquidityPoolAnalyticsController.js";
+import { VolatilityService } from "../services/volatility.service";
 
 const router = Router();
 
@@ -56,6 +58,8 @@ const router = Router();
  */
 router.get("/ohlc", getOhlcCandles);
 
+router.get("/liquidity-pools", getLiquidityPoolAnalytics);
+
 /**
  * GET /api/v1/analytics/status
  * Returns the current health / run-state of the PriceAggregator worker.
@@ -76,6 +80,23 @@ router.get("/status", (_req: Request, res: Response) => {
     success: true,
     data: priceAggregatorService.getStatus(),
   });
+});
+
+/**
+ * GET /api/v1/analytics/volatility
+ * Returns the rolling 24-hour asset volatility indexes.
+ */
+router.get("/volatility", async (req: Request, res: Response) => {
+  try {
+    const indexes = await VolatilityService.calculateAndPushVolatility();
+    res.json({
+      success: true,
+      data: indexes,
+    });
+  } catch (err) {
+    console.error("[AnalyticsRouter] Error fetching volatility", err);
+    res.status(500).json({ success: false, error: "Failed to calculate volatility" });
+  }
 });
 
 export default router;

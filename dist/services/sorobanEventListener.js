@@ -6,7 +6,8 @@ import dotenv from "dotenv";
 import { logger } from "../utils/logger";
 import { verifyOrderFilledEvent } from "./orderFillVerificationService.js";
 import { ingestGovernanceVoteEvent } from "./voterHistoryService.js";
-import { circuitBreakerWebhookService } from "./circuitBreakerWebhook.js";
+import { getCacheInvalidationManager } from "../cache/CacheInvalidationManager";
+import { getOrderBookSnapshotEngine } from "./orderBookSnapshotEngine";
 dotenv.config();
 export class SorobanEventListener {
     bpManager = new BackpressureManager();
@@ -91,10 +92,26 @@ export class SorobanEventListener {
                     }
                     // Broadcast all successful updates (Essential or Metric) to UI
                     broadcastToSessions("price_update", price);
-                    // Trigger cache warming on new price update
+                    // Issue #789 – Purge stale Redis response caches before warming so
+                    // the warming worker repopulates with fresh data.
+                    try {
+                        await getCacheInvalidationManager().onLedgerEvent(price.ledgerSeq, price);
+                    }
+                    catch (err) {
+                        logger.error("[EventListener] Cache invalidation failed:", err);
+                    }
+                    // Trigger cache warming on new price update. Dynamically imported
+                    // because the warming worker pulls in the signer, which performs
+                    // secret retrieval at module load.
+                    const { getCacheWarmingWorker } = await import("./cacheWarmingWorker.js");
                     const cacheWarmingWorker = getCacheWarmingWorker();
                     cacheWarmingWorker.onNewLedger(price.ledgerSeq).catch((err) => {
                         logger.error("[EventListener] Cache warming failed:", err);
+                    });
+                    // Trigger order book snapshot on new ledger (every N ledgers)
+                    const orderBookSnapshotEngine = getOrderBookSnapshotEngine();
+                    orderBookSnapshotEngine.onNewLedger(price.ledgerSeq).catch((err) => {
+                        logger.error("[EventListener] Order book snapshot failed:", err);
                     });
                 }
                 catch (err) {
@@ -112,7 +129,6 @@ export class SorobanEventListener {
             this.server = stellarProvider.getServer();
             await this.pollOrderFilledEvents();
             await this.pollGovernanceVoteEvents();
-            await this.pollCircuitBreakerEvents();
             const transactions = await this.server
                 .transactions()
                 .forAccount(this.oraclePublicKey)
@@ -194,7 +210,9 @@ export class SorobanEventListener {
             });
         }
         catch (err) {
-            logger.networkError("[EventListener] GovernanceVoted poll failed:", { err });
+            logger.networkError("[EventListener] GovernanceVoted poll failed:", {
+                err,
+            });
             return;
         }
         for (const event of response.events ?? []) {
@@ -227,86 +245,6 @@ export class SorobanEventListener {
             }
             catch (err) {
                 logger.error("[EventListener] Failed to ingest GovernanceVoted event:", err);
-            }
-        }
-    }
-    /**
-     * Polls Soroban for Pause and CircuitBreakerTriggered events emitted by the contract
-     * and dispatches webhook notifications to registered endpoints.
-     *
-     * Expected event topics: ["Pause"] or ["CircuitBreakerTriggered", reason]
-     * Expected event data: varies by event type
-     */
-    async pollCircuitBreakerEvents() {
-        const contractId = process.env.CONTRACT_ID?.trim();
-        if (!contractId)
-            return;
-        const rpc = stellarProvider.getRpcServer();
-        let response;
-        try {
-            response = await rpc.getEvents({
-                startLedger: Math.max(1, this.lastProcessedLedger),
-                filters: [
-                    {
-                        type: "contract",
-                        contractIds: [contractId],
-                        topics: [["Pause"], ["CircuitBreakerTriggered", "*"]],
-                    },
-                ],
-                limit: 100,
-            });
-        }
-        catch (err) {
-            logger.networkError("[EventListener] Circuit breaker events poll failed:", { err });
-            return;
-        }
-        for (const event of response.events ?? []) {
-            try {
-                const topics = event.topic ?? [];
-                const eventName = topics[0];
-                if (eventName !== "Pause" && eventName !== "CircuitBreakerTriggered") {
-                    continue;
-                }
-                const txHash = event.txHash ?? event.id ?? "";
-                const ledger = Number(event.ledger ?? 0);
-                const closedAt = event.ledgerClosedAt
-                    ? new Date(event.ledgerClosedAt)
-                    : new Date();
-                // Parse event data
-                const dataVal = event.value?.value ?? event.value ?? {};
-                const details = {};
-                if (eventName === "CircuitBreakerTriggered") {
-                    // Expected data: { reason: string, triggerPrice?: number, threshold?: number }
-                    details.reason = dataVal.reason ?? "Unknown";
-                    if (dataVal.triggerPrice !== undefined)
-                        details.triggerPrice = dataVal.triggerPrice;
-                    if (dataVal.threshold !== undefined)
-                        details.threshold = dataVal.threshold;
-                    if (topics[1])
-                        details.triggerType = topics[1];
-                }
-                else if (eventName === "Pause") {
-                    // Expected data: { pausedBy: string, reason?: string }
-                    details.pausedBy = dataVal.pausedBy ?? "Unknown";
-                    if (dataVal.reason !== undefined)
-                        details.reason = dataVal.reason;
-                }
-                const cbEvent = {
-                    eventType: eventName,
-                    contractId,
-                    transactionHash: txHash,
-                    ledger,
-                    timestamp: closedAt,
-                    details,
-                };
-                // Dispatch webhook notification
-                await circuitBreakerWebhookService.dispatchEvent(cbEvent);
-                logger.info(`[EventListener] Processed ${eventName} event from ledger ${ledger}, tx: ${txHash}`);
-                if (ledger > this.lastProcessedLedger)
-                    this.lastProcessedLedger = ledger;
-            }
-            catch (err) {
-                logger.error("[EventListener] Failed to process circuit breaker event:", err);
             }
         }
     }
@@ -359,6 +297,9 @@ export class SorobanEventListener {
     }
     isActive() {
         return this.isRunning;
+    }
+    getQueueDepth() {
+        return this.bpManager.getQueueLength();
     }
 }
 //# sourceMappingURL=sorobanEventListener.js.map

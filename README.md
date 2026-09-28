@@ -34,19 +34,25 @@ TypeScript/Node.js backend for the StellarFlow oracle network. This service fetc
 
 ## Automated DB Backups (cron)
 
-This repo includes `scripts/pg_backup.sh`, which runs `pg_dump` to `backups/postgres/` and prunes backups older than 30 days.
+This repo includes `scripts/pg_backup.sh`, which creates a daily full custom-format `pg_dump`, atomically stores it in `backups/postgres/`, prunes local backups older than 30 days, and can upload an SSE-KMS encrypted copy to S3. S3 Object Lock is applied to each uploaded object; configure the destination bucket with Object Lock enabled before enabling uploads.
 
 - **Run once**: `npm run db:backup` (or `bash scripts/pg_backup.sh`)
 - **Required**: `DATABASE_URL` must be set (the script will also load it from `.env` if present)
 - **Optional**:
   - `BACKUP_DIR` (default: `backups/postgres`)
   - `BACKUP_RETENTION_DAYS` (default: `30`)
+  - `BACKUP_S3_URI` (optional; enables offsite upload)
+  - `BACKUP_S3_KMS_KEY_ID` (required with `BACKUP_S3_URI`)
+  - `BACKUP_S3_RETENTION_DAYS` and `BACKUP_S3_OBJECT_LOCK_MODE` (defaults: `30`, `COMPLIANCE`)
+  - `DRY_RUN=1` (validate backup settings without connecting to PostgreSQL or S3)
 
 Example cron (daily at 03:00 UTC):
 
 ```bash
 0 3 * * * cd /stellarflow-backend && /usr/bin/env bash scripts/pg_backup.sh >> backups/pg_backup.log 2>&1
 ```
+
+For point-in-time recovery, see [DISASTER_RECOVERY.md](DISASTER_RECOVERY.md).
 
 ### Installation
 
@@ -253,6 +259,14 @@ After the server starts, open:
 http://localhost:3000/api/v1/docs
 ```
 
+The FastAPI contract is checked into `openapi.json`. After changing Python API
+routes or models, regenerate and validate it with:
+
+```bash
+python scripts/check_openapi.py --write
+python scripts/check_openapi.py --check
+```
+
 ## 🚀 Performance & Caching
 
 The backend implements a comprehensive **multi-level caching strategy**:
@@ -282,6 +296,27 @@ Warm up cache with popular data on startup:
 npm run cache:warm
 ```
 
+### Cache Invalidation (Issue #789)
+
+The **Off-Chain Cache Invalidation Manager** (`src/cache/CacheInvalidationManager.ts`)
+purges stale Redis response caches as soon as off-chain data changes:
+
+- **Ledger events** – the Soroban event listener purges price-derived caches
+  (`market-rates:*`, `history:*`, `stats:*`, `intelligence:*`, `derived:*`,
+  `assets:*`) before the cache warming worker repopulates them.
+- **Database modification triggers** – a Prisma query extension reports
+  create/update/delete operations on cache-relevant models, which purge the
+  matching key patterns.
+- **Stream event publications** – the manager consumes Redis `events:*` streams
+  (e.g. `events:cache-invalidation`, `events:pool-reserve-alerts`) so any
+  service or API instance can request a targeted purge via Redis.
+- **Selective route-key purging** – `purgeRoutePattern()` translates route
+  patterns such as `/api/v1/pools/123/*` into cache-key globs
+  (`pools:123:*`) so only the affected keys are removed.
+
+Invalidation counters are exposed at `GET /api/v1/cache/metrics` under
+`data.invalidations`.
+
 For detailed caching documentation, see [CACHING.md](./CACHING.md).
 
 ---
@@ -291,8 +326,61 @@ For detailed caching documentation, see [CACHING.md](./CACHING.md).
 See [ROADMAP.md](./ROADMAP.md) for the full product roadmap and milestone structure.
 
 **Current milestones:**
+
 - **v0.1** — Testnet MVP (Q2 2026)
 - **v0.2** — Security Hardening (Q3 2026)
 - **v1.0** — Mainnet Launch (Q4 2026)
 
 All open issues are triaged and assigned to a milestone. Contributors can see what is planned, in progress, or blocked.
+
+# Issue #1076 — Nullifier Tree Concurrent Access Lock Guard
+
+This scaffold proposes a Redis-backed distributed lock around spent-nullifier/Merkle-tree writes.
+
+## Important
+
+This is an integration scaffold, not a verified patch against the complete repository. Before merging:
+
+1. Connect the guard to the actual nullifier ingestion/write path.
+2. Reuse the repository's existing async Redis and Celery configuration.
+3. Confirm the database transaction boundary and SQLAlchemy session lifecycle.
+4. Run concurrency tests against PostgreSQL and Redis.
+5. Confirm retry routing and dead-letter behavior.
+
+## Proposed files
+
+- `app/services/nullifier_lock.py` — ownership-safe Redis lock guard.
+- `app/services/nullifier_tree_writer.py` — transaction boundary and lock-protected write orchestration.
+- `app/tasks/nullifier_tree_retry.py` — Celery retry task for lock contention.
+- `tests/services/test_nullifier_lock.py` — lock ownership and timeout tests.
+- `tests/services/test_nullifier_tree_writer.py` — atomicity/concurrency test plan.
+- `docs/nullifier-tree-concurrency.md` — integration and operational guidance.
+
+
+# Issue #1069 — Governance Proposal Sentiment Analysis
+
+This scaffold introduces a proposal-comment sentiment pipeline with:
+- three-class output: POSITIVE, NEUTRAL, NEGATIVE
+- per-comment scores and model metadata
+- proposal-level aggregation
+- time-bucketed sentiment trends
+- API integration guidance for governance overview pages
+
+## Important
+
+This is an integration scaffold, not a verified production patch. The repository's
+actual governance models, comment source, voting schema, API router, and frontend
+contract must be connected before merge.
+
+Do not describe comment sentiment as the sentiment of all voters. Keep text sentiment
+and voting participation/results as separate signals unless a documented product
+formula is approved.
+
+# Issue #1053 — Vault Liquidation Heatmap Scaffold
+
+Includes a pure aggregation module, FastAPI endpoint seam, tests, and integration notes.
+
+The production implementation must connect the loader to the repository's active vault-position store and authoritative risk engine. The scaffold intentionally does not invent a protocol-specific liquidation formula.
+
+Run:
+`pytest tests/analytics/test_liquidation_heatmap.py -v`

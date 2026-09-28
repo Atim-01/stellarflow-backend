@@ -1,6 +1,7 @@
 import axios, { AxiosInstance, AxiosRequestConfig } from "axios";
 import http from "http";
 import https from "https";
+import { Socket } from "net";
 import { OUTGOING_HTTP_TIMEOUT_MS } from "../utils/httpTimeout";
 
 /**
@@ -45,7 +46,7 @@ const httpsAgent = new https.Agent({
 /**
  * Configure low-level socket options for keep-alive on the socket itself
  */
-function configureSocket(socket: NodeJS.Socket): void {
+function configureSocket(socket: Socket): void {
   // Enable TCP keep-alive at the OS level
   socket.setKeepAlive(true, KEEP_ALIVE_TIMEOUT_MS);
 
@@ -74,11 +75,11 @@ export const httpClient: AxiosInstance = axios.create({
 /**
  * Hook into socket creation to apply low-level TCP options
  */
-httpAgent.on("connect" as any, (socket: NodeJS.Socket) => {
+httpAgent.on("connect" as any, (socket: Socket) => {
   configureSocket(socket);
 });
 
-httpsAgent.on("connect" as any, (socket: NodeJS.Socket) => {
+httpsAgent.on("connect" as any, (socket: Socket) => {
   configureSocket(socket);
 });
 

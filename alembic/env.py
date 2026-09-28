@@ -51,6 +51,13 @@ from typing import Generator
 from alembic import context
 from sqlalchemy import create_engine, engine_from_config, pool, text
 
+try:
+    from app.models.events import _PartitionBase
+    import app.models.revenue  # register revenue models into _PartitionBase.metadata
+    target_metadata = _PartitionBase.metadata
+except ImportError:
+    target_metadata = None
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -242,7 +249,7 @@ def run_migrations_offline() -> None:
 
     context.configure(
         url=url,
-        target_metadata=None,  # metadata-less: rely on explicit migrations
+        target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         # Include schemas so cross-schema objects are handled correctly.
@@ -267,10 +274,11 @@ def run_migrations_online() -> None:
     -----
     1. Build an engine from ``DATABASE_URL``.
     2. Open a connection.
-    3. Acquire the Postgres advisory lock (60 s timeout → abort on expiry).
-    4. Run migrations inside a transaction.
-    5. Release the advisory lock.
-    6. Close the connection.
+    3. Configure non-blocking lock timeout and statement timeout.
+    4. Acquire the Postgres advisory lock (60 s timeout → abort on expiry).
+    5. Run migrations inside a transaction.
+    6. Release the advisory lock.
+    7. Close the connection.
     """
     url = _get_database_url()
 
@@ -283,10 +291,16 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
+        # Non-blocking online DDL guard: set lock_timeout (5s) and statement_timeout (60s)
+        # to ensure migrations never cause prolonged table lock starvation in production.
+        if getattr(getattr(connection, "dialect", None), "name", "") == "postgresql":
+            connection.execute(text("SET lock_timeout = '5000ms'"))
+            connection.execute(text("SET statement_timeout = '60000ms'"))
+
         with _advisory_lock(connection):
             context.configure(
                 connection=connection,
-                target_metadata=None,
+                target_metadata=target_metadata,
                 # Compare column types so Alembic can detect type-only changes.
                 compare_type=True,
                 # Emit COMMIT/ROLLBACK around each migration step so a failed
@@ -308,7 +322,8 @@ def run_migrations_online() -> None:
 # Entry point — Alembic calls this module at the top level
 # ---------------------------------------------------------------------------
 
-if context.is_offline_mode():
-    run_migrations_offline()
-else:
-    run_migrations_online()
+if getattr(context, "config", None) is not None and getattr(context.config, "config_file_name", None) is not None:
+    if context.is_offline_mode():
+        run_migrations_offline()
+    else:
+        run_migrations_online()

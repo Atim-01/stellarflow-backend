@@ -55,7 +55,12 @@ depends_on: Union[str, Sequence[str], None] = None
 def _table_exists(name: str) -> bool:
     """Return True when *name* already exists in the public schema."""
     bind = op.get_bind()
-    return sa.inspect(bind).has_table(name)
+    if bind is None or getattr(bind, "dialect", None) is None:
+        return False
+    try:
+        return sa.inspect(bind).has_table(name)
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +216,7 @@ def upgrade() -> None:
             sa.Column("isActive", sa.Boolean(), nullable=False, server_default="true"),
             sa.Column("allowedAssets", sa.String(), nullable=False),
             sa.Column("whitelistedIps", sa.ARRAY(sa.Text()),
-                      nullable=False, server_default="ARRAY[]::TEXT[]"),
+                      nullable=False, server_default=sa.text("ARRAY[]::TEXT[]")),
             sa.Column("email", sa.String(), nullable=True),
             sa.Column("passwordHash", sa.String(), nullable=True),
             sa.Column("role", sa.String(), nullable=True, server_default="'VIEWER'"),
@@ -257,7 +262,7 @@ def upgrade() -> None:
             sa.Column("key", sa.String(), nullable=False),
             sa.Column("label", sa.String(), nullable=True),
             sa.Column("scopes", sa.ARRAY(sa.Text()), nullable=False,
-                      server_default="ARRAY[]::TEXT[]"),
+                      server_default=sa.text("ARRAY[]::TEXT[]")),
             sa.Column("ownerId", sa.String(), nullable=True),
             sa.Column("isActive", sa.Boolean(), nullable=False, server_default="true"),
             sa.Column("expiresAt", sa.DateTime(timezone=True), nullable=True),

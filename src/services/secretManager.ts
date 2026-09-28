@@ -102,6 +102,9 @@ export function getSecretKey(): string {
     throw new Error("Secret key is not available in KMS mode");
   }
 
+  // Ensure the vault is populated before the first retrieval (lazy init).
+  init();
+
   const context = vault.openContext("secret-retrieval");
   try {
     return vault.retrieve(KEY_SLOT, context);

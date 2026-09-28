@@ -276,14 +276,14 @@ export class PriceAggregatorService {
 
     if (rates.length === 0) return null;
 
-    const open = rates[0] ?? 0;
-    const close = rates[rates.length - 1] ?? 0;
+    const open = rates[0]!;
+    const close = rates[rates.length - 1]!;
 
     return {
-      open: rates[0]!,
+      open,
       high: Math.max(...rates),
       low: Math.min(...rates),
-      close: rates[rates.length - 1]!,
+      close,
       count: rates.length,
     };
   }

@@ -2,6 +2,7 @@ import { PrismaClient } from "@prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
 import pg from "pg";
 import dotenv from "dotenv";
+import { publishDatabaseChange } from "../cache/CacheInvalidationManager";
 
 // Ensure environment variables are loaded
 dotenv.config();
@@ -9,6 +10,21 @@ dotenv.config();
 const globalForPrisma = globalThis as unknown as {
   prisma: PrismaClient | undefined;
 };
+
+/**
+ * Prisma models whose writes can invalidate cached API responses (Issue #789).
+ * Extend this list as new cached routes are added.
+ */
+const CACHE_RELEVANT_MODELS = new Set([
+  "OnChainPrice",
+  "PriceHistory",
+  "MultiSigPrice",
+  "MultiSigSignature",
+  "ProviderReputation",
+  "Currency",
+  "DerivedAsset",
+  "GovernanceVote",
+]);
 
 // Lazy initialization using a Proxy to prevent crashes during imports in test environments
 export const prisma = new Proxy({} as PrismaClient, {
@@ -23,11 +39,41 @@ export const prisma = new Proxy({} as PrismaClient, {
       }
       const pool = new pg.Pool({
         connectionString,
-        max: 20,
-        idleTimeoutMillis: 10000,
+        max: Number(process.env.PG_POOL_MAX ?? 20),
+        min: Number(process.env.PG_POOL_MIN ?? 0),
+        idleTimeoutMillis: Number(process.env.PG_POOL_IDLE_TIMEOUT_MS ?? 10000),
+        connectionTimeoutMillis: Number(process.env.PG_POOL_CONNECTION_TIMEOUT_MS ?? 5000),
       });
       const adapter = new PrismaPg(pool);
-      globalForPrisma.prisma = new PrismaClient({ adapter });
+      const baseClient = new PrismaClient({ adapter });
+
+      // Issue #789 – Off-Chain Cache Invalidation Manager: report cache-relevant
+      // database modifications so stale Redis response caches are purged as soon
+      // as the underlying data changes. The extension is non-blocking and never
+      // throws into the caller: any notification failure is swallowed and logged.
+      globalForPrisma.prisma = baseClient.$extends({
+        query: {
+          $allModels: {
+            async $allOperations({ model, operation, args, query }) {
+              const result = await query(args);
+              if (CACHE_RELEVANT_MODELS.has(String(model))) {
+                try {
+                  void publishDatabaseChange({
+                    model: String(model),
+                    operation: operation as any,
+                  });
+                } catch (error) {
+                  console.error(
+                    "[Prisma] Cache invalidation hook failed:",
+                    error,
+                  );
+                }
+              }
+              return result;
+            },
+          },
+        },
+      }) as unknown as PrismaClient;
     }
     const value = (globalForPrisma.prisma as any)[prop];
     if (typeof value === "function") {
