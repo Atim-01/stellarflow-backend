@@ -20,6 +20,7 @@ export declare class StellarService {
      * Submit a price update to the Stellar network.
      */
     submitPriceUpdate(currency: string, price: number, memoId: string): Promise<string>;
+    executeGovernanceProposal(contractId: string, proposalId: string): Promise<string>;
     /**
      * Submit multiple price updates in a single bundle.
      */

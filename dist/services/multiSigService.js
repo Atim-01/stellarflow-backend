@@ -3,6 +3,8 @@ import { signer } from "../signer";
 import dotenv from "dotenv";
 import axios from "axios";
 import { assertSigningAllowed } from "../state/appState";
+import { StellarService } from "./stellarService";
+import { priceReviewService } from "./priceReviewService";
 import { successfulSubmissions, failedSubmissions, gasUsagePerAsset, submissionDuration, } from "../metrics/index.js";
 dotenv.config();
 export class MultiSigService {
@@ -170,6 +172,91 @@ export class MultiSigService {
             console.error(`[MultiSig] Failed to request signature from ${remoteServerUrl}:`, error);
             return { success: false, error: String(error) };
         }
+    }
+    /**
+     * Collect a submitted signature for a multi-sig price request.
+     * Validates the signature against the required signer threshold and,
+     * once the threshold is met, broadcasts the fully signed transaction
+     * envelope to the Soroban RPC.
+     *
+     * @param payload - The signature payload submitted by a signer.
+     * @returns The updated multi-sig price record and broadcast result (if any).
+     */
+    async collectSignature(payload) {
+        const { multiSigPriceId, signature, signerPublicKey, signerName } = payload;
+        if (!signature || typeof signature !== "string" || signature.length === 0) {
+            throw new Error("Signature is required and must be a non-empty string");
+        }
+        if (!signerPublicKey || typeof signerPublicKey !== "string") {
+            throw new Error("signerPublicKey is required");
+        }
+        const multiSigPrice = await prisma.multiSigPrice.findUnique({
+            where: { id: multiSigPriceId },
+        });
+        if (!multiSigPrice) {
+            throw new Error(`MultiSigPrice ${multiSigPriceId} not found`);
+        }
+        if (multiSigPrice.status !== "PENDING") {
+            throw new Error(`Cannot collect signature for MultiSigPrice ${multiSigPriceId} - status is ${multiSigPrice.status}`);
+        }
+        if (new Date() > multiSigPrice.expiresAt) {
+            await prisma.multiSigPrice.update({
+                where: { id: multiSigPriceId },
+                data: { status: "EXPIRED" },
+            });
+            throw new Error(`MultiSigPrice ${multiSigPriceId} has expired`);
+        }
+        // Store the submitted signature (dedupe on unique signerPublicKey).
+        let createdSignature = true;
+        try {
+            await prisma.multiSigSignature.create({
+                data: {
+                    multiSigPriceId,
+                    signerPublicKey,
+                    signerName: signerName || "external-signer",
+                    signature,
+                },
+            });
+        }
+        catch (error) {
+            if (error?.code !== "P2002") {
+                throw error;
+            }
+            createdSignature = false;
+        }
+        let updated = multiSigPrice;
+        if (createdSignature) {
+            updated = await prisma.multiSigPrice.update({
+                where: { id: multiSigPriceId },
+                data: { collectedSignatures: { increment: 1 } },
+            });
+        }
+        console.info(`[MultiSig] Collected signature ${updated.collectedSignatures}/${updated.requiredSignatures} for MultiSigPrice ${multiSigPriceId}`);
+        const thresholdMet = updated.collectedSignatures >= updated.requiredSignatures;
+        let broadcast;
+        if (thresholdMet) {
+            await this.approveMultiSigPrice(multiSigPriceId);
+            // Broadcast the fully signed transaction envelope to Soroban RPC.
+            const signatures = await this.getSignatures(multiSigPriceId);
+            const signatureList = signatures.map((sig) => ({
+                signerPublicKey: sig.signerPublicKey,
+                signature: sig.signature,
+            }));
+            const memoId = updated.memoId || `MS-${multiSigPriceId}`;
+            const stellarService = new StellarService();
+            const txHash = await stellarService.submitMultiSignedPriceUpdate(updated.currency, updated.rate.toNumber(), memoId, signatureList);
+            await this.recordSubmission(multiSigPriceId, memoId, txHash);
+            await priceReviewService.markContractSubmitted(updated.priceReviewId, memoId, txHash);
+            broadcast = { txHash };
+            console.info(`[MultiSig] MultiSigPrice ${multiSigPriceId} broadcast to Soroban RPC - TxHash: ${txHash}`);
+        }
+        return {
+            multiSigPrice: updated,
+            collectedSignatures: updated.collectedSignatures,
+            requiredSignatures: updated.requiredSignatures,
+            thresholdMet,
+            broadcast,
+        };
     }
     async getMultiSigPrice(multiSigPriceId) {
         return prisma.multiSigPrice.findUnique({

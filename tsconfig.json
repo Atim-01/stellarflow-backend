@@ -13,8 +13,8 @@
     // Environment Settings
     "module": "ESNext",
     "target": "ESNext",
-    "moduleResolution": "node",
-    "ignoreDeprecations": "5.0",
+    "moduleResolution": "bundler",
+    "ignoreDeprecations": "6.0",
     "allowSyntheticDefaultImports": true,
     "esModuleInterop": true,
     "types": ["node"],

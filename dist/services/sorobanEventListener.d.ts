@@ -24,6 +24,23 @@ export declare class SorobanEventListener {
      */
     private startWorker;
     private pollTransactions;
+    private pollOrderFilledEvents;
+    /**
+     * Polls Soroban for GovernanceVoted events emitted by the governance contract
+     * and upserts a GovernanceVote row for each unique (accountId, proposalId) pair.
+     *
+     * Expected event topics: ["GovernanceVoted", accountId, proposalId]
+     * Expected event data:   { choice: "For"|"Against"|"Abstain", weight: string }
+     */
+    private pollGovernanceVoteEvents;
+    /**
+     * Polls Soroban for Pause and CircuitBreakerTriggered events emitted by the contract
+     * and dispatches webhook notifications to registered endpoints.
+     *
+     * Expected event topics: ["Pause"] or ["CircuitBreakerTriggered", reason]
+     * Expected event data: varies by event type
+     */
+    private pollCircuitBreakerEvents;
     private extractMemoId;
     private parseOperations;
     stop(): void;

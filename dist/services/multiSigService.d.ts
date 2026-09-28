@@ -30,6 +30,29 @@ export declare class MultiSigService {
         success: boolean;
         error?: string;
     }>;
+    /**
+     * Collect a submitted signature for a multi-sig price request.
+     * Validates the signature against the required signer threshold and,
+     * once the threshold is met, broadcasts the fully signed transaction
+     * envelope to the Soroban RPC.
+     *
+     * @param payload - The signature payload submitted by a signer.
+     * @returns The updated multi-sig price record and broadcast result (if any).
+     */
+    collectSignature(payload: {
+        multiSigPriceId: number;
+        signature: string;
+        signerPublicKey: string;
+        signerName?: string;
+    }): Promise<{
+        multiSigPrice: any;
+        collectedSignatures: number;
+        requiredSignatures: number;
+        thresholdMet: boolean;
+        broadcast?: {
+            txHash: string;
+        };
+    }>;
     getMultiSigPrice(multiSigPriceId: number): Promise<any>;
     getPendingMultiSigPrices(): Promise<any[]>;
     cleanupExpiredRequests(): Promise<number>;

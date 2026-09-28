@@ -4,6 +4,9 @@ import { broadcastToSessions } from "../lib/socket";
 import stellarProvider from "../lib/stellarProvider";
 import dotenv from "dotenv";
 import { logger } from "../utils/logger";
+import { verifyOrderFilledEvent } from "./orderFillVerificationService.js";
+import { ingestGovernanceVoteEvent } from "./voterHistoryService.js";
+import { circuitBreakerWebhookService } from "./circuitBreakerWebhook.js";
 dotenv.config();
 export class SorobanEventListener {
     bpManager = new BackpressureManager();
@@ -88,6 +91,11 @@ export class SorobanEventListener {
                     }
                     // Broadcast all successful updates (Essential or Metric) to UI
                     broadcastToSessions("price_update", price);
+                    // Trigger cache warming on new price update
+                    const cacheWarmingWorker = getCacheWarmingWorker();
+                    cacheWarmingWorker.onNewLedger(price.ledgerSeq).catch((err) => {
+                        logger.error("[EventListener] Cache warming failed:", err);
+                    });
                 }
                 catch (err) {
                     logger.error("[Worker] Failed to process queued price:", err);
@@ -102,6 +110,9 @@ export class SorobanEventListener {
     async pollTransactions() {
         try {
             this.server = stellarProvider.getServer();
+            await this.pollOrderFilledEvents();
+            await this.pollGovernanceVoteEvents();
+            await this.pollCircuitBreakerEvents();
             const transactions = await this.server
                 .transactions()
                 .forAccount(this.oraclePublicKey)
@@ -137,6 +148,166 @@ export class SorobanEventListener {
             if (error instanceof Error && error.message.includes("status code 404"))
                 return;
             throw error;
+        }
+    }
+    async pollOrderFilledEvents() {
+        const contractId = process.env.CONTRACT_ID?.trim();
+        if (!contractId)
+            return;
+        const rpc = stellarProvider.getRpcServer();
+        const response = await rpc.getEvents({
+            startLedger: Math.max(1, this.lastProcessedLedger),
+            filters: [{ type: "contract", contractIds: [contractId] }],
+            limit: 100,
+        });
+        for (const event of response.events ?? []) {
+            await verifyOrderFilledEvent(event);
+            const ledger = Number(event.ledger ?? 0);
+            if (ledger > this.lastProcessedLedger)
+                this.lastProcessedLedger = ledger;
+        }
+    }
+    /**
+     * Polls Soroban for GovernanceVoted events emitted by the governance contract
+     * and upserts a GovernanceVote row for each unique (accountId, proposalId) pair.
+     *
+     * Expected event topics: ["GovernanceVoted", accountId, proposalId]
+     * Expected event data:   { choice: "For"|"Against"|"Abstain", weight: string }
+     */
+    async pollGovernanceVoteEvents() {
+        const contractId = (process.env.GOVERNANCE_CONTRACT_ID ?? process.env.CONTRACT_ID)?.trim();
+        if (!contractId)
+            return;
+        const rpc = stellarProvider.getRpcServer();
+        let response;
+        try {
+            response = await rpc.getEvents({
+                startLedger: Math.max(1, this.lastProcessedLedger),
+                filters: [
+                    {
+                        type: "contract",
+                        contractIds: [contractId],
+                        topics: [["GovernanceVoted", "*", "*"]],
+                    },
+                ],
+                limit: 200,
+            });
+        }
+        catch (err) {
+            logger.networkError("[EventListener] GovernanceVoted poll failed:", { err });
+            return;
+        }
+        for (const event of response.events ?? []) {
+            try {
+                // Topics: [eventName, accountId, proposalId]
+                const topics = event.topic ?? [];
+                const accountId = topics[1];
+                const proposalId = topics[2];
+                if (!accountId || !proposalId)
+                    continue;
+                // Data value is a Soroban SCVal map – coerce to plain object
+                const dataVal = event.value?.value ?? event.value ?? {};
+                const choice = dataVal.choice ?? "Abstain";
+                const weight = dataVal.weight ?? "0";
+                const txHash = event.txHash ?? event.id ?? null;
+                const ledger = Number(event.ledger ?? 0);
+                const closedAt = event.ledgerClosedAt
+                    ? new Date(event.ledgerClosedAt)
+                    : new Date();
+                await ingestGovernanceVoteEvent({
+                    accountId,
+                    proposalId,
+                    choice,
+                    weight,
+                    txHash,
+                    votedAt: closedAt,
+                });
+                if (ledger > this.lastProcessedLedger)
+                    this.lastProcessedLedger = ledger;
+            }
+            catch (err) {
+                logger.error("[EventListener] Failed to ingest GovernanceVoted event:", err);
+            }
+        }
+    }
+    /**
+     * Polls Soroban for Pause and CircuitBreakerTriggered events emitted by the contract
+     * and dispatches webhook notifications to registered endpoints.
+     *
+     * Expected event topics: ["Pause"] or ["CircuitBreakerTriggered", reason]
+     * Expected event data: varies by event type
+     */
+    async pollCircuitBreakerEvents() {
+        const contractId = process.env.CONTRACT_ID?.trim();
+        if (!contractId)
+            return;
+        const rpc = stellarProvider.getRpcServer();
+        let response;
+        try {
+            response = await rpc.getEvents({
+                startLedger: Math.max(1, this.lastProcessedLedger),
+                filters: [
+                    {
+                        type: "contract",
+                        contractIds: [contractId],
+                        topics: [["Pause"], ["CircuitBreakerTriggered", "*"]],
+                    },
+                ],
+                limit: 100,
+            });
+        }
+        catch (err) {
+            logger.networkError("[EventListener] Circuit breaker events poll failed:", { err });
+            return;
+        }
+        for (const event of response.events ?? []) {
+            try {
+                const topics = event.topic ?? [];
+                const eventName = topics[0];
+                if (eventName !== "Pause" && eventName !== "CircuitBreakerTriggered") {
+                    continue;
+                }
+                const txHash = event.txHash ?? event.id ?? "";
+                const ledger = Number(event.ledger ?? 0);
+                const closedAt = event.ledgerClosedAt
+                    ? new Date(event.ledgerClosedAt)
+                    : new Date();
+                // Parse event data
+                const dataVal = event.value?.value ?? event.value ?? {};
+                const details = {};
+                if (eventName === "CircuitBreakerTriggered") {
+                    // Expected data: { reason: string, triggerPrice?: number, threshold?: number }
+                    details.reason = dataVal.reason ?? "Unknown";
+                    if (dataVal.triggerPrice !== undefined)
+                        details.triggerPrice = dataVal.triggerPrice;
+                    if (dataVal.threshold !== undefined)
+                        details.threshold = dataVal.threshold;
+                    if (topics[1])
+                        details.triggerType = topics[1];
+                }
+                else if (eventName === "Pause") {
+                    // Expected data: { pausedBy: string, reason?: string }
+                    details.pausedBy = dataVal.pausedBy ?? "Unknown";
+                    if (dataVal.reason !== undefined)
+                        details.reason = dataVal.reason;
+                }
+                const cbEvent = {
+                    eventType: eventName,
+                    contractId,
+                    transactionHash: txHash,
+                    ledger,
+                    timestamp: closedAt,
+                    details,
+                };
+                // Dispatch webhook notification
+                await circuitBreakerWebhookService.dispatchEvent(cbEvent);
+                logger.info(`[EventListener] Processed ${eventName} event from ledger ${ledger}, tx: ${txHash}`);
+                if (ledger > this.lastProcessedLedger)
+                    this.lastProcessedLedger = ledger;
+            }
+            catch (err) {
+                logger.error("[EventListener] Failed to process circuit breaker event:", err);
+            }
         }
     }
     // ... (Keep extractMemoId and parseOperations methods as they were) ...

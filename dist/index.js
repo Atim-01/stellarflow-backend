@@ -12,6 +12,7 @@ import app from "./app";
 import prisma from "./lib/prisma";
 import { disconnectRedis } from "./lib/redis";
 import { initSocket } from "./lib/socket";
+import { startLiquidityRebalancingWorker } from "./services/liquidity/bootstrap";
 import { SorobanEventListener } from "./services/sorobanEventListener";
 import { multiSigSubmissionService } from "./services/multiSigSubmissionService";
 import { getGasBalanceMonitorService, } from "./services/gasBalanceMonitorService";
@@ -29,6 +30,8 @@ import { registerTracingShutdownHandlers } from "./utils/shutdownTracing";
 import { providerSecretRotationService } from "./services/providerSecretRotationService";
 import { priceAggregatorService } from "./services/priceAggregatorService";
 import { contractSanityCheckService } from "./services/contractSanityCheckService";
+import { governanceTimelockService } from "./services/governanceTimelockService";
+import { storageRentBumpService } from "./services/storageRentBumpService";
 // Load environment variables
 dotenv.config();
 // Normalize safe startup environment strings before runtime storage.
@@ -216,6 +219,7 @@ app.get("/", (req, res) => {
 // Start server
 const httpServer = createServer(app);
 initSocket(httpServer);
+const liquidityRebalancingWorker = startLiquidityRebalancingWorker();
 let sorobanEventListener = null;
 // FIX 1: Typed as nullable — constructor is not called at module level,
 // so a missing secret env var won't crash the process before the server starts.
@@ -253,11 +257,14 @@ const shutdown = async (signal) => {
     try {
         sorobanEventListener?.stop();
         multiSigSubmissionService.stop();
+        governanceTimelockService.stop();
+        liquidityRebalancingWorker?.stop();
         // FIX 2: Optional chaining — safe to call even if service never started
         gasBalanceMonitorService?.stop();
         hourlyAverageService.stop();
         priceAggregatorService.stop();
         providerSecretRotationService.stop();
+        storageRentBumpService.stop();
         stopConfigWatcher();
         stopEnvFileWatcher?.();
         await closeHttpServer();
@@ -291,6 +298,8 @@ httpServer.listen(PORT, async () => {
     console.log(`📚 API Documentation available at http://localhost:${PORT}/api/docs`);
     console.log(`🏥 Health check at http://localhost:${PORT}/health`);
     console.log(`🔌 Socket.io ready for dashboard connections`);
+    redisOperationsWorker.start();
+    console.log(`🧹 Redis operations worker started`);
     // Perform contract sanity check before starting ingestion loop
     let contractSanityPassed = true;
     if (contractSanityCheckService.isConfigured()) {
@@ -341,6 +350,15 @@ httpServer.listen(PORT, async () => {
             console.warn("Multi-sig submission service not started:", err instanceof Error ? err.message : err);
         }
     }
+    try {
+        governanceTimelockService.start().catch((err) => {
+            console.error("Failed to start governance timelock service:", err);
+        });
+        console.log("Governance timelock service started");
+    }
+    catch (err) {
+        console.warn("Governance timelock service not started:", err instanceof Error ? err.message : err);
+    }
     // Start background hourly average job
     try {
         hourlyAverageService.start().catch((err) => {
@@ -376,6 +394,15 @@ httpServer.listen(PORT, async () => {
     }
     catch (err) {
         console.warn("Gas balance monitor service not started:", err instanceof Error ? err.message : err);
+    }
+    // Start storage rent bump service
+    try {
+        storageRentBumpService.start().catch((err) => {
+            console.error("Failed to start storage rent bump service:", err);
+        });
+    }
+    catch (err) {
+        console.warn("Storage rent bump service not started:", err instanceof Error ? err.message : err);
     }
 });
 export default app;

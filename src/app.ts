@@ -13,6 +13,7 @@ import swaggerUi from "swagger-ui-express";
 import cacheMetricsRouter from "./cache/CacheMetrics";
 
 import { specs } from "./lib/swagger";
+import webhookEndpointsRouter from "./routes/webhookEndpoints.js";
 
 import { adminMiddleware } from "./middleware/adminMiddleware";
 import { adminRateLimitMiddleware } from "./middleware/adminRateLimitMiddleware";
@@ -57,6 +58,7 @@ import analyticsRouter from "./routes/analytics";
 import zkRouter from "./routes/zk";
 import governanceRouter from "./routes/governance";
 import proofRouter from "./routes/proof";
+import sorobanRentEstimateRouter from "./routes/sorobanRentEstimate.js";
 import { sendApiError } from "./lib/apiError.js";
 
 dotenv.config();
@@ -209,6 +211,9 @@ app.use("/api/v1/analytics", analyticsRouter);
 app.use("/api/v1/zk", zkRouter);
 app.use("/api/v1/governance", governanceRouter);
 app.use("/api/v1/proof", proofRouter);
+
+// Webhook endpoints for circuit breaker notifications
+app.use("/api/admin/webhook-endpoints", adminMiddleware, adminRateLimitMiddleware, webhookEndpointsRouter);
 
 app.use("/api/v1/governance", governanceRouter);
 
