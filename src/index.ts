@@ -51,6 +51,7 @@ import { storageMonitorService } from "./services/storageMonitorService";
 import { complianceScreeningWorker } from "./services/complianceScreeningWorker";
 import { startDekRotationJob } from "./jobs/dekRotationJob";
 import { ledgerEventStreamWorker } from "./services/ledgerEventStreamWorker";
+import { getStaleSessionPurgeWorker } from "./services/staleSessionPurgeWorker";
 
 // Load environment variables
 dotenv.config();
@@ -351,6 +352,7 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     storageRentBumpService.stop();
     redisOperationsWorker.stop();
     complianceScreeningWorker.stop();
+    getStaleSessionPurgeWorker().stop();
     getOrderBookSnapshotEngine().stop();
     VolatilityService.stop();
     ArbitrageScanner.stop();
@@ -413,6 +415,10 @@ httpServer.listen(PORT, async () => {
 
   complianceScreeningWorker.start();
   console.log(`🛡️ Compliance screening worker started`);
+
+  // Issue #1054 – hourly purge of abandoned Redis user session keys
+  getStaleSessionPurgeWorker().start();
+  console.log(`🧹 Stale session purge worker started (hourly)`);
 
   // Start PostgreSQL storage footprint monitor (Issue #813)
   try {

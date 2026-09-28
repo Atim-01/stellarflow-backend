@@ -2,6 +2,10 @@ import { Server, Socket } from "socket.io";
 import { randomUUID } from "crypto";
 import { encode } from "@msgpack/msgpack";
 import { getApiContentSecurityPolicy } from "../middleware/securityHeadersMiddleware";
+import {
+  claimSessionConnectionForToken,
+  unregisterSessionConnection,
+} from "./sessionConnectionRegistry";
 
 interface Session {
   id: string; // connectionSessionId
@@ -61,6 +65,18 @@ export function initSocket(server: import("http").Server): Server {
 
   io.on("connection", (socket: Socket) => {
     console.log(`🔌 Client connected: ${socket.id}`);
+
+    // Claim the authenticated user session (Issue #1054) so the stale session
+    // purge worker never removes a session that still owns a live connection.
+    let authSessionId: string | null = null;
+    const handshakeToken = readHandshakeToken(socket);
+    if (handshakeToken) {
+      void claimSessionConnectionForToken(handshakeToken).then((sid) => {
+        if (sid && socket.connected) {
+          authSessionId = sid;
+        }
+      });
+    }
 
     // Assign or Resume Session
     socket.on(
@@ -160,6 +176,9 @@ export function initSocket(server: import("http").Server): Server {
     socket.on("disconnect", (reason) => {
       console.log(`🔌 Client disconnected (${reason}): ${socket.id}`);
       clearInterval(heartbeatInterval);
+      if (authSessionId) {
+        unregisterSessionConnection(authSessionId);
+      }
       handleDisconnect(socket);
     });
   });
@@ -168,6 +187,14 @@ export function initSocket(server: import("http").Server): Server {
   setInterval(cleanupSessions, CLEANUP_INTERVAL);
 
   return io;
+}
+
+/**
+ * Read the raw session token carried by a socket handshake, if any.
+ */
+function readHandshakeToken(socket: Socket): string | null {
+  const token = socket.handshake.auth?.token;
+  return typeof token === "string" && token.length > 0 ? token : null;
 }
 
 function handleDisconnect(socket: Socket) {
