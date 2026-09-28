@@ -64,6 +64,12 @@ try:
 except ImportError:
     _HAS_REBALANCING_ROUTER = False
 
+try:
+    from app.routers import s3_cleaner as s3_cleaner_router
+    _HAS_S3_CLEANER_ROUTER = True
+except ImportError:
+    _HAS_S3_CLEANER_ROUTER = False
+
 log = structlog.get_logger(__name__)
 
 
@@ -239,6 +245,9 @@ if _HAS_SHIELDED_ROUTER:
 
 if _HAS_REBALANCING_ROUTER:
     app.include_router(rebalancing_router.router, prefix="/api/v1")
+
+if _HAS_S3_CLEANER_ROUTER:
+    app.include_router(s3_cleaner_router.router, prefix="/api/v1")
 
 @app.get("/health")
 def health_check():
