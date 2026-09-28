@@ -1579,3 +1579,25 @@ model HarvestExecution {
   @@index([strategyId, evaluatedAt])
   @@index([status, evaluatedAt])
 }
+
+// SEP-12 Customer Information Transfer (KYC) – Issue #990
+// Customer KYC payloads are AES-256-GCM encrypted at rest; only ciphertext is
+// persisted in `encryptedPayload` (see src/services/kycEncryption.ts).
+model KycCustomer {
+  id               String   @id @default(uuid())
+  account          String?  @db.VarChar(64)
+  memo             String?
+  memoType         String?  @db.VarChar(16) // id | text | hash
+  status           String   @db.VarChar(16) // ACCEPTED | PROCESSING | NEEDS_INFO | REJECTED
+  message          String?
+  encryptedPayload String   // AES-256-GCM ciphertext of the JSON KYC payload
+  fieldsRequested  Json?    // SEP-12 fields map while status = NEEDS_INFO
+  anchorReference  String?
+  provider         String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@unique([account, memoType, memo])
+  @@index([status, createdAt])
+  @@index([account])
+}
