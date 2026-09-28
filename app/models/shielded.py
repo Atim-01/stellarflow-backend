@@ -122,6 +122,14 @@ class ShieldedCommitment(_PartitionBase):
         comment="LedgerEvent.event_hash — dedup key for idempotent re-processing",
     )
 
+    # Optional encrypted copy of private proof inputs carried by the source
+    # event. Public commitments remain queryable; witness material never does.
+    encrypted_proof_inputs: Mapped[Dict[str, Any] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment="AES-256-GCM envelope for private proof inputs; plaintext is never persisted",
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -205,6 +213,12 @@ class SpentNullifier(_PartitionBase):
         unique=True,
         index=True,
         comment="LedgerEvent.event_hash — dedup key for idempotent re-processing",
+    )
+
+    encrypted_proof_inputs: Mapped[Dict[str, Any] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment="AES-256-GCM envelope for private spend inputs; plaintext is never persisted",
     )
 
     created_at: Mapped[datetime] = mapped_column(
@@ -293,6 +307,12 @@ class MerkleRoot(_PartitionBase):
             "20-element incremental tree frontier stored as JSONB array of "
             "64-char hex strings; used by MerkleService for O(depth) updates"
         ),
+    )
+
+    encrypted_tree_state: Mapped[Dict[str, Any] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment="AES-256-GCM envelope for the private nullifier-tree frontier",
     )
 
     computed_at: Mapped[datetime] = mapped_column(
