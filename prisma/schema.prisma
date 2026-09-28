@@ -330,3 +330,21 @@ model GovernanceProposal {
   @@index([contractId])
   @@index([actionType])
 }
+
+// RPC State Divergence Log
+// Stores incidents where RPC responses diverge across multiple nodes
+model RpcStateDivergence {
+  id                String   @id @default(uuid())
+  method            String   // RPC method that was called
+  params            Json     // Parameters passed to the RPC method
+  endpointHashes    Json     // Map of endpoint name -> state hash
+  majorityHash      String?  // The majority hash (if any)
+  divergingEndpoints String[] // List of endpoint names that diverged
+  timestamp         DateTime @default(now())
+  resolved          Boolean  @default(false)
+  resolutionNotes   String?
+
+  @@index([method])
+  @@index([timestamp])
+  @@index([resolved])
+}
