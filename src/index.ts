@@ -42,6 +42,8 @@ import { governanceWebhookBroadcaster } from "./services/governanceWebhookBroadc
 import { getRegionalHealthService } from "./services/regionalHealthService";
 import { storageRentBumpService } from "./services/storageRentBumpService";
 import { getOrderBookSnapshotEngine } from "./services/orderBookSnapshotEngine";
+import { systemHealthWatchdog } from "./services/systemHealthWatchdog";
+import { startAmmReserveDivergenceDetector } from "./services/ammReserveDivergenceDetector";
 import { redisOperationsWorker } from "./services/redisOperationsWorker";
 import { initializeBridgeServices, stopBridgeServices } from "./services/bridgeIntegration";
 import { VolatilityService } from "./services/volatility.service";
@@ -262,6 +264,7 @@ app.get("/", (req, res) => {
 const httpServer = createServer(app);
 initSocket(httpServer);
 const liquidityRebalancingWorker = startLiquidityRebalancingWorker();
+const ammReserveDivergenceDetector = startAmmReserveDivergenceDetector();
 let sorobanEventListener: SorobanEventListener | null = null;
 
 systemHealthWatchdog.registerWorker({
@@ -283,6 +286,18 @@ if (liquidityRebalancingWorker) {
     restart: () => {
       liquidityRebalancingWorker.stop();
       liquidityRebalancingWorker.start();
+    },
+  });
+}
+
+if (ammReserveDivergenceDetector) {
+  systemHealthWatchdog.registerWorker({
+    name: "amm-reserve-divergence-detector",
+    getLastHeartbeatAt: () => ammReserveDivergenceDetector.getLastHeartbeatAt(),
+    heartbeatTimeoutMs: ammReserveDivergenceDetector.getHeartbeatTimeoutMs(),
+    restart: () => {
+      ammReserveDivergenceDetector.stop();
+      ammReserveDivergenceDetector.start();
     },
   });
 }
@@ -338,6 +353,7 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     governanceTimelockService.stop();
     governanceWebhookBroadcaster.stop();
     liquidityRebalancingWorker?.stop();
+    ammReserveDivergenceDetector?.stop();
     apyWorker.stop();
     storageMonitorService.stop(); // <--- ADDED
     systemHealthWatchdog.stop();
