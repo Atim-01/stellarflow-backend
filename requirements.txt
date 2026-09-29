@@ -82,6 +82,13 @@ uvicorn[standard]>=0.24.0
 # (uses stdlib concurrent.futures, no extra package needed)
 
 # ---------------------------------------------------------------------------
+# Issue #973 — Automated API Endpoint Performance SLA Monitoring Middleware
+# ---------------------------------------------------------------------------
+
+# Prometheus client for metrics collection (P95/P99 latency, status codes)
+prometheus-client>=0.20.0
+
+# ---------------------------------------------------------------------------
 # Integration test suite (Issue #793)
 # ---------------------------------------------------------------------------
 

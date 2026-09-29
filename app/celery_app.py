@@ -84,5 +84,10 @@ celery_app.conf.update(
             "task": "app.tasks.generate_treasury_yield_report",
             "schedule": crontab(minute="0", hour="0", day_of_month="1"),
         },
+        # Issue #973 — SLA monitoring and compliance recording
+        "record-sla-metrics": {
+            "task": "sla.record_metrics",
+            "schedule": crontab(minute="*/5"),
+        },
     },
 )

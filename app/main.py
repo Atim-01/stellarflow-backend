@@ -2,6 +2,7 @@
 
 Issue #824 — Shielded Transaction Proof Verification Offloading Engine
 Issue #NEW — Cryptographically Signed Audit Logging System for Administrative Operations
+Issue #973 — Build Automated API Endpoint Performance SLA Monitoring Middleware
 
 The Dockerfile starts this module with:
     uvicorn app.main:app --host 0.0.0.0 --port 8000
@@ -21,10 +22,13 @@ from contextlib import asynccontextmanager
 
 import structlog
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
+from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, generate_latest
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.core.logging import bind_request_context, clear_contextvars
+from app.middleware.sla_monitoring import SLAMonitoringMiddleware
 from app.models.proof import ProofVerificationRequest, ProofVerificationResponse
 from app.services.executor_pool import (
     LATENCY_BUDGET_MS,
@@ -160,11 +164,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="StellarFlow Backend Services",
-    description="Combined service including proof verification, revenue tracking, and compliance audit logging",
+    description="Combined service including proof verification, revenue tracking, compliance audit logging, and SLA monitoring",
     version="1.0.0",
     lifespan=lifespan,
 )
 
+# Add middleware (order matters: last added = first executed)
+# SLA monitoring should be outer layer to track all requests including middleware overhead
+app.add_middleware(SLAMonitoringMiddleware, sla_target_p99_ms=200.0)
 app.add_middleware(StructlogRequestMiddleware)
 
 
@@ -210,26 +217,43 @@ async def auth_challenge_consume(
 
 @app.get("/health")
 async def health() -> JSONResponse:
+    """Health check endpoint for load balancers and monitoring."""
     return JSONResponse(
         {
+            "status": "ok",
             "success": True,
-            "service": "proof-verification",
+            "service": "stellarflow-backend",
             "processPoolWorkers": PROOF_PROCESS_POOL_WORKERS,
             "cacheTtlSeconds": PROOF_CACHE_TTL_SECONDS,
         }
     )
+
+
+@app.get("/metrics")
+async def metrics() -> PlainTextResponse:
+    """Prometheus metrics endpoint for SLA monitoring and observability.
     
-    try:
-        response = await call_next(request)
-        return response
-    except Exception as e:
-        status_code = getattr(e, "status_code", 500)
-        if isinstance(e, HTTPException):
-            status_code = e.status_code
-        if status_code in (401, 404):
-            raise e
-        sentry_sdk.capture_exception(e)
-        raise e
+    Issue #973 — Build Automated API Endpoint Performance SLA Monitoring Middleware
+    
+    This endpoint exposes Prometheus metrics collected by the SLAMonitoringMiddleware:
+    - http_request_duration_seconds: Request latency histogram (P50, P95, P99)
+    - http_requests_total: Request counter by endpoint, method, and status code
+    - http_requests_active: Active request gauge
+    - http_sla_violations_total: SLA violation counter
+    - http_request_size_bytes: Request size histogram
+    - http_response_size_bytes: Response size histogram
+    
+    Prometheus scrapes this endpoint at regular intervals (typically every 15-60s)
+    to collect metrics for alerting, dashboards, and SLA compliance tracking.
+    """
+    return PlainTextResponse(
+        content=generate_latest(REGISTRY),
+        media_type=CONTENT_TYPE_LATEST,
+    )
+
+
+# Include routers
+# Include routers
 
 if _HAS_REVENUE_ROUTER:
     app.include_router(revenue_router.router, prefix="/api/v1")
@@ -239,7 +263,3 @@ if _HAS_SHIELDED_ROUTER:
 
 if _HAS_REBALANCING_ROUTER:
     app.include_router(rebalancing_router.router, prefix="/api/v1")
-
-@app.get("/health")
-def health_check():
-    return {"status": "ok"}
