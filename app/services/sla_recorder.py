@@ -7,12 +7,14 @@ SLA compliance scores to the `endpoint_sla_metrics` table for dashboard
 analytics and historical trend tracking.
 
 The worker runs as a Celery beat task (scheduled every 5 minutes) and:
-1. Queries Prometheus metrics for all monitored endpoints
+1. Queries Prometheus metrics for all monitored endpoints (HTTP and WebSocket)
 2. Calculates latency percentiles (P50, P95, P99)
-3. Aggregates request counts and error rates
+3. Aggregates request/message counts and error rates
 4. Computes SLA compliance scores
 5. Writes records to the endpoint_sla_metrics table
 6. Checks for violations and triggers alerts if needed
+
+Supports both HTTP REST endpoints and WebSocket message handlers.
 """
 
 import os
@@ -75,11 +77,13 @@ def get_all_monitored_endpoints() -> List[tuple]:
     """Get a list of all endpoints that have metrics in the registry.
     
     Returns:
-        List of (method, endpoint) tuples
+        List of tuples:
+        - For HTTP: (endpoint_type='http', method, endpoint, None, None)
+        - For WebSocket: (endpoint_type='websocket', None, endpoint, action, channel)
     """
     endpoints = set()
     
-    # Scan the Prometheus registry for all unique endpoint labels
+    # Scan for HTTP endpoints
     for collector in REGISTRY._collector_to_names:
         if hasattr(collector, "_name") and collector._name == "http_request_duration_seconds":
             for metric_family in collector.collect():
@@ -88,36 +92,181 @@ def get_all_monitored_endpoints() -> List[tuple]:
                     endpoint = sample.labels.get("endpoint")
                     
                     if method and endpoint:
-                        endpoints.add((method, endpoint))
+                        endpoints.add(("http", method, endpoint, None, None))
+    
+    # Scan for WebSocket endpoints
+    for collector in REGISTRY._collector_to_names:
+        if hasattr(collector, "_name") and collector._name == "websocket_message_duration_seconds":
+            for metric_family in collector.collect():
+                for sample in metric_family.samples:
+                    endpoint = sample.labels.get("endpoint")
+                    action = sample.labels.get("action")
+                    channel = sample.labels.get("channel")
+                    
+                    if endpoint:
+                        endpoints.add(("websocket", None, endpoint, action, channel))
     
     return list(endpoints)
 
 
+def get_websocket_metrics(
+    endpoint: str,
+    action: Optional[str],
+    channel: Optional[str],
+    window_minutes: int = 5,
+) -> Optional[Dict[str, Any]]:
+    """Get aggregated metrics for a WebSocket endpoint over a time window.
+    
+    Args:
+        endpoint: WebSocket endpoint path (e.g., "/ws/live")
+        action: WebSocket action type (e.g., "subscribe", "message")
+        channel: Channel/topic name
+        window_minutes: Time window to analyze
+        
+    Returns:
+        Dictionary of metrics or None if insufficient data
+    """
+    labels = {"endpoint": endpoint}
+    if action:
+        labels["action"] = action
+    if channel:
+        labels["channel"] = channel
+    
+    metrics = {
+        "endpoint": endpoint,
+        "action": action,
+        "channel": channel,
+        "window_start": datetime.utcnow() - timedelta(minutes=window_minutes),
+        "window_end": datetime.utcnow(),
+    }
+    
+    try:
+        # Get message handling latency from histogram
+        histogram_name = "websocket_message_duration_seconds"
+        
+        for collector in REGISTRY._collector_to_names:
+            if hasattr(collector, "_name") and collector._name == histogram_name:
+                for metric_family in collector.collect():
+                    buckets = []
+                    for sample in metric_family.samples:
+                        if sample.name == f"{histogram_name}_bucket":
+                            # Check if labels match
+                            if all(sample.labels.get(k) == v for k, v in labels.items() if v is not None):
+                                le = sample.labels.get("le")
+                                if le != "+Inf":
+                                    buckets.append((float(le), sample.value))
+                    
+                    if buckets:
+                        buckets.sort()
+                        total_count = buckets[-1][1] if buckets else 0
+                        
+                        if total_count > 0:
+                            metrics["total_messages"] = int(total_count)
+                            metrics["latency_p99_seconds"] = calculate_p99_from_buckets(buckets, total_count)
+                            metrics["latency_p99_ms"] = metrics["latency_p99_seconds"] * 1000
+        
+        # Get message counts by status
+        counter_name = "websocket_messages_total"
+        success_count = 0
+        error_count = 0
+        total_count = 0
+        
+        for collector in REGISTRY._collector_to_names:
+            if hasattr(collector, "_name") and collector._name == counter_name:
+                for metric_family in collector.collect():
+                    for sample in metric_family.samples:
+                        sample_labels = sample.labels
+                        # Check if endpoint/action/channel match
+                        if (sample_labels.get("endpoint") == endpoint and
+                            (action is None or sample_labels.get("action") == action) and
+                            (channel is None or sample_labels.get("channel") == channel)):
+                            status = sample_labels.get("status", "")
+                            count = sample.value
+                            total_count += count
+                            
+                            if status == "success":
+                                success_count += count
+                            elif status == "error":
+                                error_count += count
+        
+        if total_count > 0:
+            metrics["total_messages"] = int(total_count)
+            metrics["success_count"] = int(success_count)
+            metrics["error_count"] = int(error_count)
+            metrics["success_rate"] = (success_count / total_count) * 100
+            metrics["error_rate"] = (error_count / total_count) * 100
+        
+        # Get connection metrics
+        connection_histogram_name = "websocket_connection_duration_seconds"
+        connection_count = 0
+        avg_duration = 0.0
+        
+        for collector in REGISTRY._collector_to_names:
+            if hasattr(collector, "_name") and collector._name == connection_histogram_name:
+                for metric_family in collector.collect():
+                    for sample in metric_family.samples:
+                        if sample.labels.get("endpoint") == endpoint:
+                            if sample.name == f"{connection_histogram_name}_count":
+                                connection_count = int(sample.value)
+                            elif sample.name == f"{connection_histogram_name}_sum":
+                                total_duration = sample.value
+                                if connection_count > 0:
+                                    avg_duration = total_duration / connection_count
+        
+        if connection_count > 0:
+            metrics["total_connections"] = connection_count
+            metrics["avg_connection_duration_seconds"] = avg_duration
+        
+        return metrics if metrics.get("total_messages", 0) > 0 else None
+        
+    except Exception as exc:
+        log.exception(
+            "Failed to get WebSocket endpoint metrics",
+            endpoint=endpoint,
+            action=action,
+            channel=channel,
+            error=str(exc)
+        )
+        return None
+
+
 async def record_endpoint_metrics(
     session: AsyncSession,
-    method: str,
+    endpoint_type: str,
+    method: Optional[str],
     endpoint: str,
+    action: Optional[str],
+    channel: Optional[str],
     window_minutes: int,
 ) -> Optional[EndpointSLAMetric]:
     """Record SLA metrics for a specific endpoint to the database.
     
     Args:
         session: Database session
-        method: HTTP method
-        endpoint: Normalized endpoint path
+        endpoint_type: 'http' or 'websocket'
+        method: HTTP method (None for WebSocket)
+        endpoint: Endpoint path
+        action: WebSocket action type (None for HTTP)
+        channel: WebSocket channel (None for HTTP)
         window_minutes: Size of the aggregation window in minutes
         
     Returns:
         Created EndpointSLAMetric record or None if insufficient data
     """
-    # Get metrics from Prometheus
-    metrics = get_endpoint_metrics(method, endpoint, window_minutes)
+    # Get metrics from Prometheus based on endpoint type
+    if endpoint_type == "websocket":
+        metrics = get_websocket_metrics(endpoint, action, channel, window_minutes)
+    else:
+        metrics = get_endpoint_metrics(method, endpoint, window_minutes)
     
     if not metrics:
         log.debug(
             "sla_recorder.no_metrics",
+            endpoint_type=endpoint_type,
             method=method,
             endpoint=endpoint,
+            action=action,
+            channel=channel,
         )
         return None
     
@@ -129,22 +278,27 @@ async def record_endpoint_metrics(
     sla_metric = EndpointSLAMetric(
         window_start=window_start,
         window_end=window_end,
+        endpoint_type=endpoint_type,
         http_method=method,
         route_path=endpoint,
-        route_name=None,  # Could be populated from FastAPI route metadata
-        total_requests=metrics.get("total_requests", 0),
+        route_name=None,
+        websocket_action=action,
+        websocket_channel=channel,
+        total_requests=metrics.get("total_requests") or metrics.get("total_messages", 0),
         success_requests=metrics.get("success_count", 0),
-        error_4xx_requests=metrics.get("error_4xx_count", 0),
-        error_5xx_requests=metrics.get("error_5xx_count", 0),
-        latency_p50_ms=None,  # Would need to calculate from histogram
-        latency_p95_ms=None,  # Would need to calculate from histogram
+        error_4xx_requests=metrics.get("error_4xx_count", 0) if endpoint_type == "http" else 0,
+        error_5xx_requests=metrics.get("error_5xx_count", 0) if endpoint_type == "http" else 0,
+        latency_p50_ms=None,
+        latency_p95_ms=None,
         latency_p99_ms=metrics.get("latency_p99_ms"),
-        latency_max_ms=None,  # Would need to track separately
-        latency_mean_ms=None,  # Would need to calculate from histogram
+        latency_max_ms=None,
+        latency_mean_ms=None,
         sla_target_p99_ms=sla_target_ms,
         sla_compliant=metrics.get("latency_p99_ms", 0) <= sla_target_ms,
         sla_violations=1 if metrics.get("latency_p99_ms", 0) > sla_target_ms else 0,
-        alert_triggered=False,  # Set by alert service
+        total_connections=metrics.get("total_connections") if endpoint_type == "websocket" else None,
+        avg_connection_duration_seconds=metrics.get("avg_connection_duration_seconds") if endpoint_type == "websocket" else None,
+        alert_triggered=False,
         alert_sent_at=None,
         notes=None,
     )
@@ -156,9 +310,19 @@ async def record_endpoint_metrics(
         # Check if a record already exists for this window
         stmt = select(EndpointSLAMetric).where(
             EndpointSLAMetric.window_start == window_start,
-            EndpointSLAMetric.http_method == method,
+            EndpointSLAMetric.endpoint_type == endpoint_type,
             EndpointSLAMetric.route_path == endpoint,
         )
+        
+        # Add type-specific filters
+        if endpoint_type == "http":
+            stmt = stmt.where(EndpointSLAMetric.http_method == method)
+        else:
+            stmt = stmt.where(
+                EndpointSLAMetric.websocket_action == action,
+                EndpointSLAMetric.websocket_channel == channel,
+            )
+        
         existing = await session.execute(stmt)
         existing_record = existing.scalar_one_or_none()
         
@@ -174,10 +338,17 @@ async def record_endpoint_metrics(
             existing_record.sla_violations = sla_metric.sla_violations
             existing_record.compliance_score = sla_metric.compliance_score
             
+            if endpoint_type == "websocket":
+                existing_record.total_connections = sla_metric.total_connections
+                existing_record.avg_connection_duration_seconds = sla_metric.avg_connection_duration_seconds
+            
             log.debug(
                 "sla_recorder.updated",
+                endpoint_type=endpoint_type,
                 method=method,
                 endpoint=endpoint,
+                action=action,
+                channel=channel,
                 p99_ms=sla_metric.latency_p99_ms,
                 compliance_score=sla_metric.compliance_score,
             )
@@ -188,8 +359,11 @@ async def record_endpoint_metrics(
             
             log.info(
                 "sla_recorder.recorded",
+                endpoint_type=endpoint_type,
                 method=method,
                 endpoint=endpoint,
+                action=action,
+                channel=channel,
                 total_requests=sla_metric.total_requests,
                 p99_ms=sla_metric.latency_p99_ms,
                 sla_compliant=sla_metric.sla_compliant,
@@ -200,8 +374,11 @@ async def record_endpoint_metrics(
     except Exception as exc:
         log.exception(
             "sla_recorder.failed",
+            endpoint_type=endpoint_type,
             method=method,
             endpoint=endpoint,
+            action=action,
+            channel=channel,
             error=str(exc),
         )
         return None
@@ -286,8 +463,10 @@ async def record_sla_metrics() -> Dict[str, int]:
     # Record metrics for each endpoint
     async for session in get_async_session():
         try:
-            for method, endpoint in endpoints:
-                record = await record_endpoint_metrics(session, method, endpoint, window_minutes)
+            for endpoint_type, method, endpoint, action, channel in endpoints:
+                record = await record_endpoint_metrics(
+                    session, endpoint_type, method, endpoint, action, channel, window_minutes
+                )
                 
                 if record:
                     if record.id:

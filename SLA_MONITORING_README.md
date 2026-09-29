@@ -4,43 +4,82 @@
 
 ## Overview
 
-This system tracks P95 and P99 latency SLA targets across all public REST and WebSocket routes, provides real-time Prometheus metrics, sends HTTP alert notifications for violations, and records compliance scores in PostgreSQL for dashboard analytics.
+This system tracks P95 and P99 latency SLA targets across all public **REST and WebSocket routes**, provides real-time Prometheus metrics, sends HTTP alert notifications for violations, and records compliance scores in PostgreSQL for dashboard analytics.
+
+### Supported Endpoint Types
+
+- **HTTP/REST endpoints**: GET, POST, PUT, DELETE, PATCH requests
+- **WebSocket endpoints**: Message handling, connection duration, pub/sub channels
 
 ## Architecture
 
 ### Components
 
-1. **SLA Monitoring Middleware** (`app/middleware/sla_monitoring.py`)
+1. **HTTP SLA Monitoring Middleware** (`app/middleware/sla_monitoring.py`)
    - Wraps every HTTP request
    - Tracks request duration, status codes, and payload sizes
    - Exposes Prometheus metrics for scraping
    - Logs slow requests in real-time
 
-2. **Prometheus Metrics** (exposed at `/metrics`)
+2. **WebSocket SLA Monitoring** (`app/middleware/websocket_sla_monitoring.py`)
+   - Tracks WebSocket message handling latency
+   - Monitors connection duration and lifecycle
+   - Records message throughput by action type and channel
+   - Provides context managers and decorators for easy integration
+   - See [WEBSOCKET_SLA_INTEGRATION.md](WEBSOCKET_SLA_INTEGRATION.md) for integration guide
+
+3. **Prometheus Metrics** (exposed at `/metrics`)
    - `http_request_duration_seconds`: Histogram with P50/P95/P99 latency percentiles
    - `http_requests_total`: Counter by endpoint, method, and status code
    - `http_requests_active`: Gauge of in-flight requests
    - `http_sla_violations_total`: Counter of SLA threshold violations
    - `http_request_size_bytes`: Request payload size histogram
    - `http_response_size_bytes`: Response payload size histogram
+   - `websocket_message_duration_seconds`: WebSocket message handling latency histogram
+   - `websocket_messages_total`: Counter by endpoint, action, channel, and status
+   - `websocket_connections_active`: Gauge of active WebSocket connections
+   - `websocket_connection_duration_seconds`: Connection lifetime histogram
+   - `websocket_sla_violations_total`: Counter of WebSocket SLA violations
+   - `websocket_message_size_bytes`: WebSocket message size histogram
 
-3. **Alert Service** (`app/services/sla_alerting.py`)
+4. **Alert Service** (`app/services/sla_alerting.py`)
    - Monitors P99 latency over 5-minute sliding windows
    - Sends HTTP webhook alerts when P99 > 200ms
    - Implements cooldown period to prevent alert spam
-   - Includes detailed violation context (request volume, error rates, etc.)
+   - Includes detailed violation context (request/message volume, error rates, etc.)
+   - Supports both HTTP and WebSocket endpoints
 
-4. **Background Recorder** (`app/services/sla_recorder.py`)
+5. **Background Recorder** (`app/services/sla_recorder.py`)
    - Celery beat task running every 5 minutes
-   - Aggregates Prometheus metrics per endpoint
+   - Aggregates Prometheus metrics per endpoint (HTTP and WebSocket)
    - Calculates compliance scores (0.0-1.0)
    - Writes records to `endpoint_sla_metrics` table
    - Cleans up records older than retention period
 
-5. **Database Model** (`app/models/sla.py`)
+6. **Database Model** (`app/models/sla.py`)
    - `EndpointSLAMetric`: Stores time-series SLA data
+   - Supports both `endpoint_type='http'` and `endpoint_type='websocket'`
+   - WebSocket-specific fields: `websocket_action`, `websocket_channel`, `total_connections`, `avg_connection_duration_seconds`
    - Indexed for efficient dashboard queries
    - Supports partitioning by time window
+
+## WebSocket Integration
+
+For detailed instructions on integrating WebSocket SLA monitoring into your endpoints, see **[WEBSOCKET_SLA_INTEGRATION.md](WEBSOCKET_SLA_INTEGRATION.md)**.
+
+**Quick Example:**
+```python
+from app.middleware import track_websocket_connection, track_websocket_message
+
+@app.websocket("/ws/live")
+async def websocket_endpoint(websocket: WebSocket):
+    async with track_websocket_connection("/ws/live"):
+        await websocket.accept()
+        while True:
+            data = await websocket.receive_text()
+            async with track_websocket_message("/ws/live", "message", "default"):
+                await websocket.send_text(f"Echo: {data}")
+```
 
 ## Configuration
 

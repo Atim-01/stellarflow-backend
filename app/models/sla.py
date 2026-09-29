@@ -37,11 +37,13 @@ class EndpointSLAMetric(Base):
     
     This table stores aggregated performance data for each endpoint over
     configurable time windows (typically 5 minutes). Metrics include:
-    - Request counts and success rates
+    - Request/message counts and success rates
     - Latency percentiles (P50, P95, P99)
     - SLA compliance status (whether P99 stayed under threshold)
-    - Error rates by status code category
+    - Error rates by status code category (HTTP) or error type (WebSocket)
+    - WebSocket-specific: connection duration, action types, channels
     
+    The `endpoint_type` field distinguishes between 'http' and 'websocket' entries.
     Rows are partitioned by `window_start` for efficient time-range queries
     and automatic data retention policies.
     """
@@ -65,21 +67,50 @@ class EndpointSLAMetric(Base):
     )
     
     # Endpoint identification
+    endpoint_type = Column(
+        String(16),
+        nullable=False,
+        default="http",
+        index=True,
+        comment="Endpoint type: 'http' or 'websocket'",
+    )
     http_method = Column(
         String(10),
-        nullable=False,
-        comment="HTTP method (GET, POST, PUT, DELETE, PATCH, etc.)",
+        nullable=True,
+        comment="HTTP method (GET, POST, PUT, DELETE, PATCH, etc.) - NULL for WebSocket",
     )
     route_path = Column(
         String(512),
         nullable=False,
         index=True,
-        comment="URL path pattern (e.g., /api/v1/users/{id})",
+        comment="URL path pattern (e.g., /api/v1/users/{id} or /ws/live)",
     )
     route_name = Column(
         String(256),
         nullable=True,
         comment="Optional route name from FastAPI endpoint definition",
+    )
+    
+    # WebSocket-specific fields
+    websocket_action = Column(
+        String(64),
+        nullable=True,
+        comment="WebSocket action type (e.g., 'subscribe', 'unsubscribe', 'message') - NULL for HTTP",
+    )
+    websocket_channel = Column(
+        String(256),
+        nullable=True,
+        comment="WebSocket channel/topic name - NULL for HTTP",
+    )
+    total_connections = Column(
+        BigInteger,
+        nullable=True,
+        comment="Total WebSocket connections in this window - NULL for HTTP",
+    )
+    avg_connection_duration_seconds = Column(
+        Float,
+        nullable=True,
+        comment="Average WebSocket connection duration in seconds - NULL for HTTP",
     )
     
     # Request volume metrics
@@ -197,11 +228,22 @@ class EndpointSLAMetric(Base):
     # Constraints and indexes
     __table_args__ = (
         # Ensure we don't duplicate metrics for the same endpoint + time window
+        # For HTTP: window_start + http_method + route_path must be unique
+        # For WebSocket: window_start + route_path + websocket_action + websocket_channel must be unique
         UniqueConstraint(
             "window_start",
-            "http_method",
+            "endpoint_type",
             "route_path",
+            "http_method",
+            "websocket_action",
+            "websocket_channel",
             name="uq_endpoint_sla_window",
+        ),
+        # Index for endpoint type filtering
+        Index(
+            "ix_endpoint_sla_type",
+            "endpoint_type",
+            "window_start",
         ),
         # Composite index for dashboard queries (recent metrics by endpoint)
         Index(
@@ -221,17 +263,35 @@ class EndpointSLAMetric(Base):
             "alert_triggered",
             "window_start",
         ),
+        # Index for WebSocket-specific queries
+        Index(
+            "ix_endpoint_sla_websocket",
+            "endpoint_type",
+            "websocket_action",
+            "websocket_channel",
+        ),
     )
     
     def __repr__(self) -> str:
-        return (
-            f"<EndpointSLAMetric("
-            f"route={self.http_method} {self.route_path}, "
-            f"window={self.window_start.isoformat()}, "
-            f"p99={self.latency_p99_ms}ms, "
-            f"compliant={self.sla_compliant}"
-            f")>"
-        )
+        if self.endpoint_type == "websocket":
+            return (
+                f"<EndpointSLAMetric("
+                f"type=websocket, route={self.route_path}, "
+                f"action={self.websocket_action}, channel={self.websocket_channel}, "
+                f"window={self.window_start.isoformat()}, "
+                f"p99={self.latency_p99_ms}ms, "
+                f"compliant={self.sla_compliant}"
+                f")>"
+            )
+        else:
+            return (
+                f"<EndpointSLAMetric("
+                f"type=http, route={self.http_method} {self.route_path}, "
+                f"window={self.window_start.isoformat()}, "
+                f"p99={self.latency_p99_ms}ms, "
+                f"compliant={self.sla_compliant}"
+                f")>"
+            )
     
     @property
     def success_rate(self) -> Optional[float]:

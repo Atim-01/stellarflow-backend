@@ -5,12 +5,14 @@ Issue #973 — Build Automated API Endpoint Performance SLA Monitoring Middlewar
 This service monitors Prometheus metrics over a 5-minute sliding window and
 sends HTTP alert notifications when P99 latency exceeds 200ms threshold.
 
+Supports both HTTP REST endpoints and WebSocket message handlers.
+
 The alert payload includes:
-- Affected endpoint (method + path)
+- Affected endpoint (method + path for HTTP, path + action + channel for WebSocket)
 - Current P99 latency value
 - SLA threshold that was exceeded
 - Time window of the violation
-- Request volume during the window
+- Request/message volume during the window
 - Error rate statistics
 """
 
@@ -309,16 +311,22 @@ def mark_alert_sent(method: str, endpoint: str) -> None:
 
 
 async def send_alert_notification(
-    method: str,
+    endpoint_type: str,
+    method: Optional[str],
     endpoint: str,
+    action: Optional[str],
+    channel: Optional[str],
     metrics: Dict[str, Any],
     sla_target_ms: float,
 ) -> bool:
     """Send an HTTP POST alert notification to the configured webhook.
     
     Args:
-        method: HTTP method
-        endpoint: Normalized endpoint path
+        endpoint_type: 'http' or 'websocket'
+        method: HTTP method (None for WebSocket)
+        endpoint: Endpoint path
+        action: WebSocket action type (None for HTTP)
+        channel: WebSocket channel (None for HTTP)
         metrics: Endpoint metrics dictionary
         sla_target_ms: SLA target threshold that was violated
         
@@ -331,15 +339,33 @@ async def send_alert_notification(
         log.warning("SLA alert webhook URL not configured, skipping notification")
         return False
     
+    # Build endpoint identification based on type
+    if endpoint_type == "websocket":
+        endpoint_info = {
+            "type": "websocket",
+            "path": endpoint,
+            "action": action or "N/A",
+            "channel": channel or "N/A",
+        }
+        endpoint_description = f"WebSocket {endpoint}"
+        if action:
+            endpoint_description += f" (action: {action})"
+        if channel:
+            endpoint_description += f" [channel: {channel}]"
+    else:
+        endpoint_info = {
+            "type": "http",
+            "method": method,
+            "path": endpoint,
+        }
+        endpoint_description = f"{method} {endpoint}"
+    
     # Build alert payload
     payload = {
         "alert_type": "sla_violation",
         "severity": "warning" if metrics.get("latency_p99_ms", 0) < sla_target_ms * 1.5 else "critical",
         "timestamp": datetime.utcnow().isoformat(),
-        "endpoint": {
-            "method": method,
-            "path": endpoint,
-        },
+        "endpoint": endpoint_info,
         "violation": {
             "metric": "p99_latency",
             "current_value_ms": round(metrics.get("latency_p99_ms", 0), 2),
@@ -355,19 +381,27 @@ async def send_alert_notification(
             "duration_minutes": get_alert_window_minutes(),
         },
         "statistics": {
-            "total_requests": metrics.get("total_requests", 0),
+            "total_requests": metrics.get("total_requests") or metrics.get("total_messages", 0),
             "success_count": metrics.get("success_count", 0),
-            "error_4xx_count": metrics.get("error_4xx_count", 0),
-            "error_5xx_count": metrics.get("error_5xx_count", 0),
+            "error_count": metrics.get("error_count", 0) if endpoint_type == "websocket" else (
+                metrics.get("error_4xx_count", 0) + metrics.get("error_5xx_count", 0)
+            ),
             "success_rate_percent": round(metrics.get("success_rate", 0), 2),
             "error_rate_percent": round(metrics.get("error_rate", 0), 2),
         },
         "message": (
-            f"SLA violation detected: {method} {endpoint} P99 latency "
+            f"SLA violation detected: {endpoint_description} P99 latency "
             f"({metrics.get('latency_p99_ms', 0):.2f}ms) exceeded threshold "
             f"({sla_target_ms}ms) over the last {get_alert_window_minutes()} minutes"
         ),
     }
+    
+    # Add WebSocket-specific stats if applicable
+    if endpoint_type == "websocket":
+        payload["statistics"]["total_connections"] = metrics.get("total_connections", 0)
+        payload["statistics"]["avg_connection_duration_seconds"] = round(
+            metrics.get("avg_connection_duration_seconds", 0), 2
+        )
     
     try:
         async with aiohttp.ClientSession() as session:
@@ -379,8 +413,11 @@ async def send_alert_notification(
                 if response.status in (200, 201, 202, 204):
                     log.info(
                         "sla_alert.sent",
+                        endpoint_type=endpoint_type,
                         method=method,
                         endpoint=endpoint,
+                        action=action,
+                        channel=channel,
                         p99_ms=metrics.get("latency_p99_ms"),
                         threshold_ms=sla_target_ms,
                     )
@@ -388,8 +425,11 @@ async def send_alert_notification(
                 else:
                     log.error(
                         "sla_alert.failed",
+                        endpoint_type=endpoint_type,
                         method=method,
                         endpoint=endpoint,
+                        action=action,
+                        channel=channel,
                         status_code=response.status,
                         response_text=await response.text(),
                     )
@@ -398,8 +438,11 @@ async def send_alert_notification(
     except Exception as exc:
         log.exception(
             "sla_alert.error",
+            endpoint_type=endpoint_type,
             method=method,
             endpoint=endpoint,
+            action=action,
+            channel=channel,
             error=str(exc),
         )
         return False
@@ -414,7 +457,7 @@ async def check_sla_violations() -> List[Dict[str, Any]]:
     """Check all monitored endpoints for SLA violations and send alerts.
     
     This function should be called periodically (e.g., every minute) by a
-    background worker to monitor SLA compliance across all endpoints.
+    background worker to monitor SLA compliance across all HTTP and WebSocket endpoints.
     
     Returns:
         List of violations detected (for logging/debugging)
@@ -425,7 +468,7 @@ async def check_sla_violations() -> List[Dict[str, Any]]:
     
     log.debug("sla_alert.check_started", sla_target_ms=sla_target_ms, window_minutes=window_minutes)
     
-    # Get all unique endpoint labels from the metrics registry
+    # Get all unique endpoint labels from the metrics registry (HTTP endpoints)
     endpoints_checked = set()
     
     for collector in REGISTRY._collector_to_names:
@@ -436,13 +479,31 @@ async def check_sla_violations() -> List[Dict[str, Any]]:
                     endpoint = sample.labels.get("endpoint")
                     
                     if method and endpoint:
-                        endpoint_key = (method, endpoint)
+                        endpoint_key = ("http", method, endpoint, None, None)
+                        if endpoint_key not in endpoints_checked:
+                            endpoints_checked.add(endpoint_key)
+    
+    # Get all WebSocket endpoints
+    for collector in REGISTRY._collector_to_names:
+        if hasattr(collector, "_name") and collector._name == "websocket_message_duration_seconds":
+            for metric_family in collector.collect():
+                for sample in metric_family.samples:
+                    endpoint = sample.labels.get("endpoint")
+                    action = sample.labels.get("action")
+                    channel = sample.labels.get("channel")
+                    
+                    if endpoint:
+                        endpoint_key = ("websocket", None, endpoint, action, channel)
                         if endpoint_key not in endpoints_checked:
                             endpoints_checked.add(endpoint_key)
     
     # Check each endpoint for violations
-    for method, endpoint in endpoints_checked:
-        metrics = get_endpoint_metrics(method, endpoint, window_minutes)
+    for endpoint_type, method, endpoint, action, channel in endpoints_checked:
+        if endpoint_type == "websocket":
+            from app.services.sla_recorder import get_websocket_metrics
+            metrics = get_websocket_metrics(endpoint, action, channel, window_minutes)
+        else:
+            metrics = get_endpoint_metrics(method, endpoint, window_minutes)
         
         if not metrics:
             continue
@@ -452,24 +513,38 @@ async def check_sla_violations() -> List[Dict[str, Any]]:
         # Check if P99 exceeds the SLA target
         if p99_ms > sla_target_ms:
             violation = {
+                "endpoint_type": endpoint_type,
                 "method": method,
                 "endpoint": endpoint,
+                "action": action,
+                "channel": channel,
                 "p99_ms": p99_ms,
                 "threshold_ms": sla_target_ms,
                 "metrics": metrics,
             }
             violations.append(violation)
             
+            # Determine the cache key for cooldown
+            if endpoint_type == "websocket":
+                cache_key = f"{endpoint}:{action}:{channel}"
+            else:
+                cache_key = f"{method}:{endpoint}"
+            
             # Send alert if not in cooldown
-            if should_send_alert(method, endpoint):
-                alert_sent = await send_alert_notification(method, endpoint, metrics, sla_target_ms)
+            if should_send_alert(method or "WS", cache_key):
+                alert_sent = await send_alert_notification(
+                    endpoint_type, method, endpoint, action, channel, metrics, sla_target_ms
+                )
                 if alert_sent:
-                    mark_alert_sent(method, endpoint)
+                    mark_alert_sent(method or "WS", cache_key)
             else:
                 log.debug(
                     "sla_alert.cooldown",
+                    endpoint_type=endpoint_type,
                     method=method,
                     endpoint=endpoint,
+                    action=action,
+                    channel=channel,
                     p99_ms=p99_ms,
                 )
     
