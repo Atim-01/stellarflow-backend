@@ -72,6 +72,9 @@ strawberry-graphql[fastapi]>=0.262.0
 # Async ORM used by the Python service and GraphQL compatibility repository
 SQLAlchemy>=2.0.0
 
+# Database migration tool for schema version control
+alembic>=1.13.0
+
 # ASGI server for the Python service
 uvicorn[standard]>=0.24.0
 
