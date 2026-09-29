@@ -23,6 +23,21 @@ from .converter import (
 from .ema import RollingEMA, update_ema, ema_sequence, smoothing_factor, progressive_smoothing_factor
 from .latency import LatencyTracker, PacketLatencyRecord, LatencyMetrics, latency_tracker
 from .variance import IntegerVarianceEngine, VarianceParameters, parse_consensus_variance
+from .fiat_settlement import (
+    FiatSettlementLatencyMonitor,
+    Corridor,
+    AnchorHealthStatus,
+    SettlementRecord,
+    AnchorCorridorMetrics,
+    CorridorSettlementMetrics,
+    BackupPartnerCandidate,
+    RerouteResult,
+    RerouteBatchReport,
+    SLABreachAuditRecord,
+    calculate_mean_time_to_settlement,
+    is_sla_violated,
+    DEFAULT_SLA_THRESHOLD_SECONDS,
+)
 
 __all__ = [
     "BoundaryViolationError",
@@ -55,4 +70,17 @@ __all__ = [
     "IntegerVarianceEngine",
     "VarianceParameters",
     "parse_consensus_variance",
+    "FiatSettlementLatencyMonitor",
+    "Corridor",
+    "AnchorHealthStatus",
+    "SettlementRecord",
+    "AnchorCorridorMetrics",
+    "CorridorSettlementMetrics",
+    "BackupPartnerCandidate",
+    "RerouteResult",
+    "RerouteBatchReport",
+    "SLABreachAuditRecord",
+    "calculate_mean_time_to_settlement",
+    "is_sla_violated",
+    "DEFAULT_SLA_THRESHOLD_SECONDS",
 ]
