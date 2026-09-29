@@ -37,47 +37,57 @@ export const assetVolatility = new Gauge({
   labelNames: ["asset"] as const,
 });
 
-// --- Market stream metrics ---
+/**
+ * Market stream (WebSocket) metrics.
+ * Used by the combined high-frequency market data endpoint
+ * (`wss://.../v1/market-stream?pairs=USDC-XLM,BTC-USDC`).
+ */
 
 export const marketStreamConnections = new Gauge({
-  name: "stellar_market_stream_connections_active",
+  name: "market_stream_connections",
   help: "Number of currently active market-stream WebSocket connections",
-  labelNames: ["transport"] as const,
+  labelNames: ["protocol"] as const,
 });
 
 export const marketStreamConnectionsTotal = new Counter({
-  name: "stellar_market_stream_connections_total",
+  name: "market_stream_connections_total",
   help: "Total number of market-stream WebSocket connections accepted",
-  labelNames: ["transport"] as const,
+  labelNames: ["protocol"] as const,
 });
 
-export const marketStreamClientMemoryBytes = new Gauge({
-  name: "stellar_market_stream_client_memory_bytes",
-  help: "Estimated memory overhead in bytes per market-stream client connection",
-  labelNames: ["transport"] as const,
+export const marketStreamDisconnectionsTotal = new Counter({
+  name: "market_stream_disconnections_total",
+  help: "Total number of market-stream WebSocket disconnections",
+  labelNames: ["protocol", "reason"] as const,
 });
 
-export const marketStreamClientMemoryTotalBytes = new Gauge({
-  name: "stellar_market_stream_client_memory_total_bytes",
-  help: "Total estimated memory overhead in bytes for all market-stream client connections",
-  labelNames: ["transport"] as const,
+export const marketStreamMemoryBytes = new Gauge({
+  name: "market_stream_connection_memory_bytes",
+  help: "Estimated memory overhead in bytes per market-stream connection",
+  labelNames: ["protocol"] as const,
 });
 
-export const marketStreamMessagesSent = new Counter( {
-  name: "stellar_market_stream_messages_sent_total",
-  help: "Total number of market-stream events sent to clients",
-  labelNames: ["transport", "kind"] as const,
+export const marketStreamTotalMemoryBytes = new Gauge({
+  name: "market_stream_total_memory_bytes",
+  help: "Estimated total memory overhead in bytes for all market-stream connections",
+  labelNames: ["protocol"] as const,
 });
 
-export const marketStreamSubscriptions = new Gauge({
-  name: "stellar_market_stream_subscriptions_active",
-  help: "Number of active pair subscriptions across market-stream clients",
-  labelNames: ["transport"] as const,
+export const marketStreamMessagesTotal = new Counter({
+  name: "market_stream_messages_total",
+  help: "Total number of market-stream messages sent to clients",
+  labelNames: ["protocol", "kind"] as const,
 });
 
-export const marketStreamBroadcastDuration = new Histogram({
-  name: "stellar_market_stream_broadcast_duration_seconds",
-  help: "Duration of broadcasting a market update to all subscribed clients",
-  labelNames: ["transport", "kind"] as const,
-  buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5],
+export const marketStreamBytesTotal = new Counter({
+  name: "market_stream_bytes_total",
+  help: "Total number of bytes sent over market-stream connections",
+  labelNames: ["protocol"] as const,
+});
+
+export const marketStreamFanoutDuration = new Histogram({
+  name: "market_stream_fanout_duration_seconds",
+  help: "Duration of fanouting a market update to all subscribed clients in seconds",
+  labelNames: ["kind"] as const,
+  buckets: [0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5],
 });

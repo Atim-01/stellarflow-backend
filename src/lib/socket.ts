@@ -1,7 +1,6 @@
 import { Server, Socket } from "socket.io";
 import { randomUUID } from "crypto";
 import { encode } from "@msgpack/msgpack";
-import { WebSocketServer, WebSocket } from "ws";
 import { getApiContentSecurityPolicy } from "../middleware/securityHeadersMiddleware";
 
 interface Session {
@@ -15,36 +14,29 @@ interface Session {
   msgpackEnabled?: boolean; // Indicates if this session prefers MessagePack
 }
 
-const sessions = new Map<string, Session>();
-const HEARTBEAT_INTERVAL = 30000;
-const HEARTBEAT_TIMEOUT = 10000;
-const GRACE_PERIOD = 60000;
-const CLEANUP_INTERVAL = 60000;
-
-let io: Server | null = null;
-let wss: WebSocketServer | null = null;
-
-interface MarketStreamClient {
-  id: string;
-  ws: WebSocket;
+interface MarketSubscription {
   pairs: Set<string>;
   msgpackEnabled: boolean;
-  lastSeen: number;
-  isAlive: boolean;
+  lastUpdate: number;
 }
 
-const marketStreamClients = new Map<string, MarketStreamClient>();
-const pairSubscribers = new Map<string, Set<string>>();
-const MARKET_STREAM_HEARTBEAT = 30000;
-
-interface MarketUpdate {
-  pair: string;
+interface MarketEvent {
   type: "price" | "volume" | "orderbook";
+  pair: string;
   data: any;
   timestamp: number;
 }
 
-const latestMarketState = new Map<string, { price?: any; volume?: any; orderbook?: any }>();
+const sessions = new Map<string, Session>();
+const marketSubscriptions = new Map<string, MarketSubscription>(); // socketId -> subscription
+const pairSubscribers = new Map<string, Set<string>>(); // pair -> set of socketIds
+const HEARTBEAT_INTERVAL = 30000;
+const HEARTBEAT_TIMEOUT = 10000;
+const GRACE_PERIOD = 60000;
+const CLEANUP_INTERVAL = 60000;
+const MAX_PAIRS_PER_SOCKET = 50;
+
+let io: Server | null = null;
 
 /**
  * Broadcasts an event to all connected clients and queues it for those in grace period.
@@ -70,65 +62,146 @@ export function broadcastToSessions(event: string, data: any) {
 }
 
 /**
- * Broadcasts a market update to all subscribed market-stream clients.
- * Multiplexes price, volume, and orderbook updates into a single event stream.
+ * Publishes a market event to all subscribed sockets for the given pair.
+ * Multiplexes price, volume, and order book updates into a single stream.
  */
-export function broadcastMarketUpdate(update: MarketUpdate) {
-  const state = latestMarketState.get(update.pair) || {};
-  if (update.type === "price") state.price = update.data;
-  else if (update.type === "volume") state.volume = update.data;
-  else if (update.type === "orderbook") state.orderbook = update.data;
-  latestMarketState.set(update.pair, state);
+export function publishMarketEvent(event: MarketEvent) {
+  if (!io) return;
 
-  const subscribers = pairSubscribers.get(update.pair);
+  const subscribers = pairSubscribers.get(event.pair);
   if (!subscribers || subscribers.size === 0) return;
 
   const payload = {
-    pair: update.pair,
-    type: update.type,
-    data: update.data,
-    timestamp: update.timestamp,
+    type: event.type,
+    pair: event.pair,
+    data: event.data,
+    timestamp: event.timestamp || Date.now(),
   };
 
-  const jsonPayload = JSON.stringify(payload);
-  const msgpackPayload = encode(payload);
+  for (const socketId of subscribers) {
+    const socket = io.sockets.sockets.get(socketId);
+    if (!socket) continue;
 
-  for (const clientId of subscribers) {
-    const client = marketStreamClients.get(clientId);
-    if (!client || client.ws.readyState !== WebSocket.OPEN) continue;
-    try {
-      if (client.msgpackEnabled) {
-        client.ws.send(msgpackPayload);
-      } else {
-        client.ws.send(jsonPayload);
-      }
-    } catch (err) {
-      console.warn(`⚠️ Failed to send market update to ${clientId}:`, err);
+    const sub = marketSubscriptions.get(socketId);
+    if (!sub) continue;
+
+    sub.lastUpdate = Date.now();
+
+    if (sub.msgpackEnabled) {
+      socket.emit("market", encode(payload));
+    } else {
+      socket.emit("market", payload);
     }
   }
 }
 
 /**
- * Returns memory overhead statistics for market-stream clients.
+ * Returns memory overhead estimate for active client connections.
+ * Used to validate support for 10,000 active sockets.
  */
-export function getMarketStreamStats() {
-  let totalPairs = 0;
-  for (const subs of pairSubscribers.values()) totalPairs += subs.size;
+export function getConnectionMemoryStats() {
+  const memory = process.memoryUsage();
+  const activeSockets = io ? io.sockets.size : 0;
+  const activeSessions = sessions.size;
+  const activeSubscriptions = marketSubscriptions.size;
+  const heapUsed = memory.heapUsed;
+  const rss = memory.rss;
+
   return {
-    activeClients: marketStreamClients.size,
-    totalPairSubscriptions: totalPairs,
-    uniquePairs: pairSubscribers.size,
-    estimatedBytesPerClient: 512,
-    estimatedTotalBytes: marketStreamClients.size * 512,
+    activeSockets,
+    activeSessions,
+    activeSubscriptions,
+    heapUsed,
+    rss,
+    estimatedBytesPerSocket:
+      activeSockets > 0 ? Math.round((heapUsed - (global as any).__baselineHeap ?? heapUsed)) / activeSockets) : 0,
+    supports10k: activeSockets === 0 || heapUsed / activeSockets < 50 * 1024,
   };
 }
 
+function normalizePair(pair: string): string | null {
+  if (typeof pair !== "string") return null;
+  const trimmed = pair.trim().toUpperCase();
+  if (!/^[A-Z0-9]{1,15}-[A-Z0-9]{1,15}$/.test(trimmed)) return null;
+  return trimmed;
+}
+
+function parsePairs(pairs: unknown): string[] | null {
+  if (pairs == null) return null;
+  const list = Array.isArray(pairs) ? pairs : String(pairs).split(",");
+  if (list.length === 0 || list.length > MAX_PAIRS_PER_SOCKET) return null;
+  const normalized: string[] = [];
+  for (const raw of list) {
+    const pair = normalizePair(raw as string);
+    if (!pair) return null;
+    if (!normalized.includes(pair)) normalized.push(pair);
+  }
+  return normalized.length > 0 ? normalized : null;
+}
+
+function addSubscription(socketId: string, pairs: string[], msgpackEnabled: boolean) {
+  const existing = marketSubscriptions.get(socketId);
+  if (existing) {
+    for (const pair of pairs) {
+      if (!existing.pairs.has(pair)) {
+        existing.pairs.add(pair);
+        let set = pairSubscribers.get(pair);
+        if (!set) {
+          set = new Set();
+          pairSubscribers.set(pair, set);
+        }
+        set.add(socketId);
+      }
+    }
+    existing.msgpackEnabled = msgpackEnabled;
+    existing.lastUpdate = Date.now();
+    return;
+  }
+
+  const pairSet = new Set(pairs);
+  marketSubscriptions.set(socketId, {
+    pairs: pairSet,
+    msgpackEnabled,
+    lastUpdate: Date.now(),
+  });
+
+  for (const pair of pairSet) {
+    let set = pairSubscribers.get(pair);
+    if (!set) {
+      set = new Set();
+      pairSubscribers.set(pair, set);
+    }
+    set.add(socketId);
+  }
+}
+
+function removeSubscription(socketId: string) {
+  const sub = marketSubscriptions.get(socketId);
+  if (!sub) return;
+  for (const pair of sub.pairs) {
+    const set = pairSubscribers.get(pair);
+    if (set) {
+      set.delete(socketId);
+      if (set.size === 0) pairSubscribers.delete(pair);
+    }
+  }
+  marketSubscriptions.delete(socketId);
+}
+
 export function initSocket(server: import("http").Server): Server {
+  if (!(global as any).__baselineHeap) {
+    (global as any).__baselineHeap = process.memoryUsage().heapUsed;
+  }
+
   io = new Server(server, {
     cors: { origin: "*" },
     // Disable built-in heartbeat to use our custom one as requested
     pingInterval: HEARTBEAT_INTERVAL,
     pingTimeout: HEARTBEAT_TIMEOUT,
+    // Reduce per-connection memory overhead for high concurrency
+    perMessageDeflate: false,
+    maxHttpBufferSize: 1e6,
+    transports: ["websocket", "polling"],
   });
 
   io.engine.on("initial_headers", (headers) => {
@@ -136,9 +209,6 @@ export function initSocket(server: import("http").Server): Server {
     headers["x-frame-options"] = "DENY";
     headers["x-content-type-options"] = "nosniff";
   });
-
-  // Initialize combined market-stream WebSocket endpoint at /v1/market-stream
-  initMarketStream(server);
 
   io.on("connection", (socket: Socket) => {
     console.log(`🔌 Client connected: ${socket.id}`);
@@ -193,8 +263,12 @@ export function initSocket(server: import("http").Server): Server {
         const session = sessions.get(sessionId);
         if (session) {
           session.msgpackEnabled = true;
-          console.log(`📦 Msgpack enabled for session ${sessionId}`);
+          console.log(`🖦 Msgpack enabled for session ${sessionId}`);
         }
+      }
+      const sub = marketSubscriptions.get(socket.id);
+      if (sub) {
+        sub.msgpackEnabled = true;
       }
     });
 
@@ -216,6 +290,78 @@ export function initSocket(server: import("http").Server): Server {
           `🆕 New session created: ${sessionId} for socket ${socket.id}`,
         );
         callback({ sessionId });
+      },
+    );
+
+    // Market stream subscription (combined price + volume + order book)
+    const handleSubscribe = (
+      payload: unknown,
+      callback?: (response: {
+        success: boolean;
+        pairs?: string[];
+        error?: string;
+      }) => void,
+    ) => {
+      const pairsInput =
+        typeof payload === "object" && payload !== null && "pairs" in (payload as any)
+          ? (payload as any).pairs
+          : payload;
+      const pairs = parsePairs(pairsInput);
+      if (!pairs) {
+        const error = "invalid_pairs";
+        if (callback) callback({ success: false, error: error });
+        else socket.emit("subscribe_error", { error: error });
+        return;
+      }
+
+      const sessionId = (socket as any).sessionId as string | undefined;
+      const msgpackEnabled = sessionId
+        ? sessions.get(sessionId)?.msgpackEnabled ?? false
+        : false;
+
+      addSubscription(socket.id, pairs, msgpackEnabled);
+      console.log(
+        `📄 Socket ${socket.id} subscribed to [${pairs.join(", ")}]`,
+      );
+
+      if (callback) callback({ success: true, pairs });
+      else socket.emit("subscribed_ok", { pairs });
+    };
+
+    socket.on("subscribe", handleSubscribe);
+    socket.on("subscribe_market", handleSubscribe);
+
+    socket.on("unsubscribe", (payload: unknown) => {
+      const pairsInput =
+        typeof payload === "object" && payload !== null && "pairs" in (payload as any)
+          ? (payload as any).pairs
+          : payload;
+      const pairs = parsePairs(pairsInput);
+      if (!pairs) {
+        socket.emit("unsubscribe_error", { error: "invalid_pairs" });
+        return;
+      }
+      const sub = marketSubscriptions.get(socket.id);
+      if (!sub) return;
+      for (const pair of pairs) {
+        if (sub.pairs.delete(pair)) {
+          const set = pairSubscribers.get(pair);
+          if (set) {
+            set.delete(socket.id);
+            if (set.size === 0) pairSubscribers.delete(pair);
+          }
+        }
+      }
+      socket.emit("subscribed_ok", { pairs: Array.from(sub.pairs) });
+    });
+
+    // Memory overhead inspection for 10,000 socket validation
+    socket.on(
+      "memory_stats",
+      (callback?: (response: any) => void) => {
+        const stats = getConnectionMemoryStats();
+        if (callback) callback(stats);
+        else socket.emit("memory_stats", stats);
       },
     );
 
@@ -241,6 +387,7 @@ export function initSocket(server: import("http").Server): Server {
     socket.on("disconnect", (reason) => {
       console.log(`🔌 Client disconnected (${reason}): ${socket.id}`);
       clearInterval(heartbeatInterval);
+      removeSubscription(socket.id);
       handleDisconnect(socket);
     });
   });
@@ -249,154 +396,6 @@ export function initSocket(server: import("http").Server): Server {
   setInterval(cleanupSessions, CLEANUP_INTERVAL);
 
   return io;
-}
-
-function initMarketStream(server: import("http").Server) {
-  wss = new WebSocketServer({ noServer: true });
-
-  server.on("upgrade", (request, socket, head) => {
-    try {
-      const url = new URL(request.url || "", `http://${request.headers.host}`);
-      if (url.pathname !== "/v1/market-stream") return;
-
-      const pairsParam = url.searchParams.get("pairs") || "";
-      const pairs = pairsParam
-        .split(",")
-        .map((p) => p.trim().toUpperCase())
-        .filter((p) => p.length > 0);
-
-      if (pairs.length === 0) {
-        socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
-        socket.destroy();
-        return;
-      }
-
-      wss!.handleUpgrade(request, socket, head, (ws) => {
-        wss!.emit("connection", ws, request, pairs);
-      });
-    } catch (err) {
-      console.warn("⚠️ Market stream upgrade failed:", err);
-      socket.destroy();
-    }
-  });
-
-  wss.on("connection", (ws: WebSocket, _request: any, pairs: string[]) => {
-    const clientId = randomUUID();
-    const client: MarketStreamClient = {
-      id: clientId,
-      ws,
-      pairs: new Set(pairs),
-      msgpackEnabled: false,
-      lastSeen: Date.now(),
-      isAlive: true,
-    };
-    marketStreamClients.set(clientId, client);
-
-    for (const pair of pairs) {
-      let subs = pairSubscribers.get(pair);
-      if (!subs) {
-        subs = new Set();
-        pairSubscribers.set(pair, subs);
-      }
-      subs.add(clientId);
-    }
-
-    console.log(`📡 Market stream client ${clientId} subscribed to: ${pairs.join(", ")}`);
-
-    // Send initial snapshot of current state for subscribed pairs
-    const snapshot: any = { type: "snapshot", pairs: {} };
-    for (const pair of pairs) {
-      const state = latestMarketState.get(pair);
-      if (state) snapshot.pairs[pair] = state;
-    }
-    try {
-      ws.send(JSON.stringify(snapshot));
-    } catch (err) {
-      console.warn(`⚠️ Failed to send snapshot to ${clientId}:`, err);
-    }
-
-    ws.on("message", (raw: Buffer) => {
-      client.lastSeen = Date.now();
-      try {
-        const msg = JSON.parse(raw.toString());
-        if (msg.type === "subscribe" && Array.isArray(msg.pairs)) {
-          for (const p of msg.pairs) {
-            const pair = String(p).toUpperCase();
-            if (client.pairs.has(pair)) continue;
-            client.pairs.add(pair);
-            let subs = pairSubscribers.get(pair);
-            if (!subs) {
-              subs = new Set();
-              pairSubscribers.set(pair, subs);
-            }
-            subs.add(clientId);
-          }
-        } else if (msg.type === "unsubscribe" && Array.isArray(msg.pairs)) {
-          for (const p of msg.pairs) {
-            const pair = String(p).toUpperCase();
-            if (!client.pairs.has(pair)) continue;
-            client.pairs.delete(pair);
-            const subs = pairSubscribers.get(pair);
-            if (subs) {
-              subs.delete(clientId);
-              if (subs.size === 0) pairSubscribers.delete(pair);
-            }
-          }
-        } else if (msg.type === "msgpack") {
-          client.msgpackEnabled = true;
-        } else if (msg.type === "pong") {
-          client.isAlive = true;
-        }
-      } catch {
-        // ignore malformed messages
-      }
-    });
-
-    ws.on("pong", () => {
-      client.isAlive = true;
-      client.lastSeen = Date.now();
-    });
-
-    ws.on("close", () => {
-      cleanupMarketStreamClient(clientId);
-    });
-
-    ws.on("error", (err) => {
-      console.warn(`⚠️ Market stream client ${clientId} error:`, err);
-      cleanupMarketStreamClient(clientId);
-    });
-  });
-
-  // Heartbeat to detect dead market-stream connections
-  setInterval(() => {
-    for (const client of marketStreamClients.values()) {
-      if (!client.isAlive) {
-        try {
-          client.ws.terminate();
-        } catch {}
-        cleanupMarketStreamClient(client.id);
-        continue;
-      }
-      client.isAlive = false;
-      try {
-        client.ws.ping();
-      } catch {}
-    }
-  }, MARKET_STREAM_HEARTBEAT);
-}
-
-function cleanupMarketStreamClient(clientId: string) {
-  const client = marketStreamClients.get(clientId);
-  if (!client) return;
-  for (const pair of client.pairs) {
-    const subs = pairSubscribers.get(pair);
-    if (subs) {
-      subs.delete(clientId);
-      if (subs.size === 0) pairSubscribers.delete(pair);
-    }
-  }
-  marketStreamClients.delete(clientId);
-  console.log(`🗑️ Market stream client removed: ${clientId}`);
 }
 
 function handleDisconnect(socket: Socket) {

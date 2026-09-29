@@ -7,435 +7,314 @@ import {
   sanitizeSignatureRequest,
 } from "../middleware/payloadSanitizer";
 import { WebSocketServer, WebSocket } from "ws";
-import { createHash } from "node:crypto";
+import { priceFeedService } from "../services/priceFeedService";
+import { orderBookService } from "../services/orderBookService";
+import { volumeService } from "../services/volumeService";
 
 const router = express.Router();
 
 /**
- * Combined High-Frequency Market Stream
- * -----------------------------------------------------------------------------
- * A single WebSocket endpoint that multiplex price, volume, and order-book
- * updates for one or more market pairs into a single JSON or MsgPack event
- * stream. Designed to hold 10,000+ active sockets with minimal per-client
- * memory overhead.
- *
- * Route: ws://.../v1/market-stream?pairs=USD-XLM,BTC-USD&format=json|msgpack
+ * Combined WebSocket market stream route.
+ * Connection URL: ws://.../v1/market-stream?pairs=USDC-XLM,BTC-USDC
  */
-
-export type MarketStreamChannel = "price" | "volume" | "orderbook";
+export const marketStreamPath = "/v1/market-stream";
 
 export interface MarketStreamEvent {
-  /** Monotonically increasing sequence number for client reordering. */
-  seq: number;
-  /** Event type discriminator. */
-  type: "snapshot" | "update" | "heartbeat" | "error";
-  /** Market pair, e.g. "USDC-XLM". */
+  type: "price" | "volume" | "orderbook";
   pair: string;
-  /** Sub-channel the event belongs to. */
-  channel?: MarketStreamChannel;
-  /** Event payload. */
-  data?: unknown;
-  /** Event timestamp in milliseconds. */
-  ts: number;
-  /** Optional error message. */
-  message?: string;
+  timestamp: number;
+  data: unknown;
 }
 
-export interface MarketStreamSubscriber {
-  id: string;
-  socket: WebSocket;
+export interface MarketStreamClient {
+  ws: WebSocket;
   pairs: Set<string>;
-  channels: Set<MarketStreamChannel>;
   format: "json" | "msgpack";
-  /** Buffered bytes waiting to be flushed; used for backpressure control. */
-  queued: number;
-  /** Whether the socket is already draining its queue. */
-  flushing: boolean;
-  /** Last activity timestamp for stale connection cleanup. */
-  lastSeen: number;
-  /** Per-connection byte counter for metrics. */
-  bytesSent: number;
+  isAlive: boolean;
+  lastPing: number;
+}
+
+const clients = new Set<MarketStreamClient>();
+
+const MAX_PAIRS = 50;
+const MAX_CONNECTIONS = 10_000;
+const HEARTBEAT_INTERVAL_MS = 30_000;
+
+function parsePairs(raw: unknown): string[] {
+  if (typeof raw !== "string" || raw.trim() === "") {
+    return [];
+  }
+  const pairs = raw
+    .split(",")
+    .map((p) => p.trim().toUpperCase())
+    .filter((p) => /^[A-Z0-9]+-[A-Z0-9]+$/.test(p));
+  return Array.from(new Set(pairs)).slice(0, MAX_PAIRS);
+}
+
+function encodeEvent(client: MarketStreamClient, event: MarketStreamEvent): Buffer | string {
+  if (client.format === "msgpack") {
+    return Buffer.from(encodeMsgPack(event));
+  }
+  return JSON.stringify(event);
 }
 
 /**
- * Minimal in-memory broadcast hub for market updates.
- *
- * The hub is deliberately single-instance and keeps only the minimum per-client
- * state (Set of pairs + Set of channels + a few numeric counters). This keeps
- * per-socket memory overhead low enough to support 10,000+ concurrent clients.
+ * Minimal MsgPack encoder for the market stream event shape.
+ * Supports string, number, boolean, null, arrays and plain objects.
  */
-export class MarketStreamHub {
-  private subscribers = new Map<string, MarketStreamSubscriber>();
-  private seq = 0;
-  private heartbeatInterval: NodeJS.Timer | null = null;
-  private staleTimeoutMs = 60 _ 000;
-  private maxQueuedBytes = 256 * 1024;
-
-  constructor() {
-    this.heartbeatInterval = setInterval(() => this.heartbeat(), 30 _000);
-    // Do not keep the Node process alive solely for heartbeats.
-    if (typeof this.heartbeatInterval.unref === "function") {
-      this.heartbeatInterval.unref();
-    }
-  }
-
-  /** Number of currently connected subscribers. */
-  get size(): number {
-    return this.subscribers.size;
-  }
-
-  /**
-   * Register a new WebSocket client and attach its subscription state.
-   */
-  addClient(
-    socket: WebSocket,
-    pairs: string[],
-    channels: MarketStreamChannel[],
-    format: "json" | "msgpack",
-  ): MarketStreamSubscriber {
-    const id = createHash("sha1").update(`${Date.now()}:${Math.random()}`).digest("hex");
-    const subscriber: MarketStreamSubscriber = {
-      id,
-      socket,
-      pairs: new Set(pairs),
-      channels: new Set(channels),
-      format,
-      queued: 0,
-      flushing: false,
-      lastSeen: Date.now(),
-      bytesSent: 0,
-    };
-    this.subscribers.set(id, subscriber);
-    return subscriber;
-  }
-
-  /** Remove a client and free its per-connection state. */
-  removeClient(id: string): void {
-    const subscriber = this.subscribers.get(id);
-    if (!subscriber) return;
-    this.subscribers.delete(id);
-    try {
-      if (
-        subscriber.socket.readyState === WebSocket.OPEN ||
-        subscriber.socket.readyState === WebSocket.CONNECTING
-      ) {
-        subscriber.socket.close(1000, "client removed");
-      }
-    } catch {
-      // ignore close errors
-    }
-  }
-
-  /** Update the pairs a subscriber is interested in. */
-  setPairs(id: string, pairs: string[]): boolean {
-    const subscriber = this.subscribers.get(id);
-    if (!subscriber) return false;
-    subscriber.pairs = new Set(pairs);
-    subscriber.lastSeen = Date.now();
-    return true;
-  }
-
-  /** Update the channels a subscriber is interested in. */
-  setChannels(id: string, channels: MarketStreamChannel[]): boolean {
-    const subscriber = this.subscribers.get(id);
-    if (!subscriber) return false;
-    subscriber.channels = new Set(channels);
-    subscriber.lastSeen = Date.now();
-    return true;
-  }
-
-  /** 
-   * Broadcast an event to all subscribers that match the pair and channel.
-   * Returns the number of clients the event was queued for.
-   */
-  broadcast(
-    pair: string,
-    channel: MarketStreamChannel,
-    data: unknown,
-    type: "snapshot" | "update" = "update",
-  ): number {
-    const now = Date.now();
-    const event: MarketStreamEvent = {
-      seq: ++this.seq,
-      type,
-      pair,
-      channel,
-      data,
-      ts: now,
-    };
-    let delivered = 0;
-    for (const subscriber of this.subscribers.values()) {
-      if (!subscriber.pairs.has(pair)) continue;
-      if (!subscriber.channels.has(channel)) continue;
-      if (subscriber.socket.readyState !== WebSocket.OPEN) continue;
-      this.sendTo(subscriber, event);
-      delivered++;
-    }
-    return delivered;
-  }
-
-  /** Broadcast a heartbeat to all connected clients. */
-  private heartbeat(): void {
-    const now = Date.now();
-    const event: MarketStreamEvent = {
-      seq: ++this.seq,
-      type: "heartbeat",
-      pair: "*",
-      ts: now,
-    };
-    for (const subscriber of this.subscribers.values()) {
-      if (subscriber.socket.readyState === WebSocket.OPEN ||
-          subscriber.socket.readyState === WebSocket.CONNECTING) {
-        this.sendTo(subscriber, event);
-      }
-    }
-    // Clean up stale connections that never completed the handshake.
-    for (const [id, subscriber] of this.subscribers) {
-      if (now - subscriber.lastSeen > this.staleTimeoutMs) {
-        this.removeClient(id);
-      }
-    }
-  }
-
-  /** Encode and queue an event for a single subscriber. */
-  private sendTo(subscriber: MarketStreamSubscriber, event: MarketStreamEvent): void {
-    if (subscriber.queued > this.maxQueuedBytes) {
-      // Backpressure: drop the client rather than growing memory unbounded.
-      this.removeClient(subscriber.id);
-      return;
-    }
-    const payload = this.encode(event, subscriber.format);
-    subscriber.queued += payload.length;
-    subscriber.bytesSent += payload.length;
-    subscriber.lastSeen = Date.now();
-    try {
-      subscriber.socket.send(payload, (err?: Error) => {
-        subscriber.queued -= payload.length;
-        if (subscriber.queued < 0) subscriber.queued = 0;
-        if (err) {
-          this.removeClient(subscriber.id);
-        }
-      });
-    } catch {
-      this.removeClient(subscriber.id);
-    }
-  }
-
-  /** Encode an event as JSON or MsgPack. */
-  private encode(event: MarketStreamEvent, format: "json" | "msgpack"): Buffer {
-    if (format === "msgpack") {
-      return Buffer.from(encodeMsgPack(event));
-    }
-    return Buffer.from(JSON.stringify(event));
-  }
-
-  /** Stop the heartbeat timer and close all clients. */
-  async close(): Promise<void> {
-    if (this.heartbeatInterval) {
-      clearInterval(this.heartbeatInterval);
-      this.heartbeatInterval = null;
-    }
-    for (const id of Array.from(this.subscribers.keys())) {
-      this.removeClient(id);
-    }
-  }
-
-  /** Return a snapshot of per-client memory usage for monitoring. */
-  memoryStats(): { clients: number; estimatedBytes: number } {
-    // Estimate based on the size of the per-client state object plus a fixed
-    // allowance for the underlying socket buffers.
-    const perClient = 512 + 64 * 4;
-    return {
-      clients: this.subscribers.size,
-      estimatedBytes: this.subscribers.size * perClient,
-    };
-  }
-}
-
-/** Minimal MsgPack encoder for the flat MarketStreamEvent shape. */
-function encodeMsgPack(event: MarketStreamEvent): Uint8Array {
+export function encodeMsgPack(value: unknown): Uint8Array {
   const chunks: number[] = [];
-  const push = (...bytes: number[]) => chunks.push(...bytes);
-  // Fix map of 6 entries.
-  push(0x80);
-  // seq
-  push(0x01);
-  pushUint32(chunks, event.seq);
-  // type
-  push(0x02);
-  pushString(chunks, event.type);
-  // pair
-  push(0x03);
-  pushString(chunks, event.pair);
-  // channel
-  if (event.channel) {
-    push(0x04);
-    pushString(chunks, event.channel);
-  }
-  // data
-  if (event.data !== undefined) {
-    push(0x05);
-    pushString(chunks, JSON.stringify(event.data));
-  }
-  // ts
-  push(0x06);
-  pushUint64(chunks, event.ts);
+  const textEncoder = new TextEncoder();
+
+  const pushUint8 = (n?: number) => {
+    chunks.push(n === undefined ? 0 : n & 0xff);
+  };
+
+  const pushUint16 = (n: number) => {
+    chunks.push((n >> 8) & 0xff, n & 0xff);
+  };
+
+  const pushUint32 = (number) => {
+    chunks.push((n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n >>> 0 & 0xff);
+  };
+
+  const pushInt64 = (n: bigint) => {
+    const big = BigInt(n.toString());
+    for (let i = 7; i >= 0; i--) {
+      chunks.push(Number((big >> BigInt(i * 8)) & 0nffn));
+    }
+  };
+
+  const pushFloat64 = (number) => {
+    const buf = new ArrayBuffer(8);
+    new DataView(buf).setFloat64(0, n, false);
+    for (const b of new Uint8Array(buf)) chunks.push(b);
+  };
+
+  const pushString = (s: string) => {
+    const bytes = textEncoder.encode(s);
+    const len = bytes.length;
+    if (len < 32) {
+      pushUint8(0xa0 | len);
+    } else if (len < 256) {
+      pushUint8(0xd9);
+      pushUint8(len);
+    } else if (len < 65536) {
+      pushUint8(0xda);
+      pushUint16(len);
+    } else {
+      pushUint8(0xbd);
+      pushUint32(len);
+    }
+    for (const b of bytes) chunks.push(b);
+  };
+
+  const pushArray = (arr: unknown[]) => {
+    const len = arr.length;
+    if (len < 16) {
+      pushUint8(0x90 | len);
+    } else if (len < 65536) {
+      pushUint8(0xdc);
+      pushUint16(len);
+    } else {
+      pushUint8(0xdd);
+      pushUint32(len);
+    }
+    for (const item of arr) encode(item);
+  };
+
+  const pushMap = (obj: Record<string, unknown>) => {
+    const keys = Object.keys(obj);
+    const len = keys.length;
+    if (len < 16) {
+      pushUint8(0x80 | len);
+    } else if (len < 65536) {
+      pushUint8(0xde);
+      pushUint16(len);
+    } else {
+      pushUint8(0xdf);
+      pushUint32(len);
+    }
+    for (const key of keys) {
+      pushString(key);
+      encode(obj[key]);
+    }
+  };
+
+  const encode = (v: unknown) => {
+    if (v === null || v === undefined) {
+      pushUint8(0xc0);
+    } else if (typeof v === "boolean") {
+      pushUint8(v ? 0xc3 : 0xc2);
+    } else if (typeof v === "number") {
+      if (Number.isInteger(v)) {
+        if (v >= 0 && v < 256) {
+          pushUint8(0xcc);
+          pushUint8(v);
+        } else if (v >= 0 && v < 65536) {
+          pushUint8(0xcd);
+          pushUint16(v);
+        } else if (v >= 0 && v < 4294967296) {
+          pushUint8(0xce);
+          pushUint32(v);
+        } else {
+          pushUint8(0xd3);
+          pushInt64(BigInt(v));
+        }
+      } else {
+        pushUint8(0xcb);
+        pushFloat64(v);
+      }
+    } else if (typeof v === "string") {
+      pushString(v);
+    } else if (Array.isArray(v)) {
+      pushArray(v);
+    } else if (typeof v === "object") {
+      pushMap(v as Record<string, unknown>);
+    } else {
+      pushUint8(0xc0);
+    }
+  };
+
+  encode(value);
   return new Uint8Array(chunks);
 }
 
-function pushUint32(chunks: number[], value: number): void {
-  const buf = new ArrayBuffer(4);
-  new DataView(buf).setUint32(0, value, false);
-  chunks.push(...new Uint8Array(buf));
+function broadcastEvent(event: MarketStreamEvent): void {
+  for (const client of clients) {
+    if (!client.pairs.has(event.pair)) continue;
+    if (client.ws.readyState !== WebSocket.OPEN) continue;
+    try {
+      client.ws.send(encodeEvent(client, event));
+    } catch (err) {
+      console.error("[WS] Failed to send market event:", err);
+    }
+  }
 }
 
-function pushUint64(chunks: number[], value: number): void {
-  const buf = new ArrayBuffer(8);
-  new DataView(buf).setBigUint64(0, BigInt(value), false);
-  chunks.push(...new Uint8Array(buf));
-}
+export function attachMarketStreamServer(server: any): WebSocketServer {
+  const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
 
-function pushString(chunks: number[], value: string): void {
-  const encoded = Buffer.from(value, "utf-8");
-  pushUint32(chunks, encoded.length);
-  chunks.push(...encoded);
-}
-
-/** Shared hub used by the WebSocket route and the REST metrics endpoint. */
-export const marketStreamHub = new MarketStreamHub();
-
-const VALID_CHANNELS: MarketStreamChannel[] = ["price", "volume", "orderbook"];
-
-function parsePairs(raw: unknown): string[] {
-  if (typeof raw !== "string" || raw.trim() === "") return [];
-  return raw
-    .split(",")
-    .map((p) => p.trim().toUpperCase())
-    .filter((p) => /^[A-Z0-9]+5-[A-Z0-9]+$/.test(p));
-}
-
-function parseChannels(raw: unknown): MarketStreamChannel[] {
-  if (typeof raw !== "string" || raw.trim() === "") return [...VALID_CHANNELS];
-  const requested = raw
-    .split(",")
-    .map((c) => c.trim().toLowerCase())
-    .filter((c): c is MarketStreamChannel =>
-      (VALID_CHANNELS as string[]).includes(c));
-  return requested.length > 0 ? requested : [...VALID_CHANNELS];
-}
-
-function parseFormat(raw: unknown): "json" | "msgpack" {
-  if (typeof raw === "string" && raw.toLowerCase() === "msgpack") return "msgpack";
-  return "json";
-}
-
-/**
- * Attach the combined market stream WebSocket handler to an HTTP server.
- *
- * This is exported so the application bootstrap can attach it to the
- * shared HTTP server used by the Express app. The route is mounted at
- * /v1/market-stream.
- */
-export function attachMarketStreamWebsocket(server: any): WebSocketServer {
-  const wss = new WebSocketServer({ server, path: "/v1/market-stream" });
-
-  wss.on("connection", (socket: WebSocket, req: any) => {
-    const url = new URL(req.url || "/", "http://localhost");
-    const pairs = parsePairs(url.searchParams.get("pairs"));
-    const channels = parseChannels(url.searchParams.get("channels"));
-    const format = parseFormat(url.searchParams.get("format"));
-
-    if (pairs.length === 0) {
-      socket.send(
-        JSON.stringify({
-          seq: 0,
-          type: "error",
-          pair: "*",
-          message: "Missing or invalid 'pairs' query parameter",
-          ts: Date.now(),
-        }),
-      );
-      socket.close(1008, "invalid pairs");
+  wss.on("connection", (ws: WebSocket, req: any) => {
+    if (clients.size >= MAX_CONNECTIONS) {
+      ws.close(1013, "Server at capacity");
       return;
     }
 
-    const subscriber = marketStreamHub.addClient(socket, pairs, channels, format);
+    const url = new URL(req.url || "", "http://localhost");
+    const pairs = parsPairs(url.searchParams.get("pairs"));
+    if (pairs.length === 0) {
+      ws.close(1008, "Missing or invalid pairs parameter");
+      return;
+    }
 
-    // Send an initial snapshot acknowledging the subscription.
-    const ack = {
-      seq: 0,
-      type: "snapshot" as const,
-      pair: "*",
-      data: { pairs, channels, format },
-      ts: Date.now(),
+    const formatParam = (url.searchParams.get("format") || "json").toLowerCase();
+    const format: "json" | "msgpack" = formatParam === "msgpack" ? "msgpack" : "json";
+
+    const client: MarketStreamClient = {
+      ws,
+      pairs: new Set(pairs),
+      format,
+      isAlive: true,
+      lastPing: Date.now(),
     };
-    socket.send(
-      format === "msgpack"
-        ? Buffer.from(encodeMsgPack(ack))
-        : Buffer.from(JSON.stringify(ack)),
+    clients.add(client);
+
+    ws.send(
+      encodeEvent(client, {
+        type: "price",
+        pair: pairs[0],
+        timestamp: Date.now(),
+        data: { subscribed: pairs, format },
+      }),
     );
 
-    socket.on("message", (raw: Buffer) => {
+    ws.on("p", () => {
+      client.lastPing = Date.now();
+    });
+
+    ws.on("message", (msg: Buffer) => {
       try {
-        const msg = JSON.parse(raw.toString());
-        if (msg && typeof msg === "object") {
-          if (Array.isArray(msg.pairs)) {
-            marketStreamHub.setPairs(subscriber.id, parsePairs(msg.pairs.join(",")));
-          }
-          if (Array.isArray(msg.channels)) {
-            marketStreamHub.setChannels(subscriber.id, parseChannels(msg.channels.join(",")));
+        const parsed = JSON.parse(msg.toString()) as { pairs?: string[] };
+        if (Array.isArray(parsed.pairs)) {
+          const next = parsPairs(parsed.pairs.join(","));
+          if (next.length > 0) {
+            client.pairs = new Set(next);
           }
         }
       } catch {
-        // Ignore malformed client messages; the connection remains open.
+        // ignore non-JSON control messages
       }
     });
 
-    socket.on("close", () => marketStreamHub.removeClient(subscriber.id));
-    socket.on("error", () => marketStreamHub.removeClient(subscriber.id));
+    ws.on("close", () => {
+      clients.delete(client);
+    });
+
+    ws.on("error", (err) => {
+      console.error("[WS] Market stream client error:", err);
+      clients.delete(client);
+    });
+  });
+
+  const heartbeat = setInterval(() => {
+    const now = Date.now();
+    for (const client of clients) {
+      if (now - client.lastPing > HEARTBEAT_INTERVAL_MS * 2) {
+        client.ws.terminate();
+        clients.delete(client);
+        continue;
+      }
+      if (client.ws.readyState === WebSocket.OPEN) {
+        client.ws.ping();
+      }
+    }
+  }, HEARTBEAT_INTERVAL_MS);
+  heartbeat.unref();
+
+  priceFeedService.on("price", (payload: { pair: string; price: number; timestamp?: number }) => {
+    broadcastEvent({
+      type: "price",
+      pair: payload.pair,
+      timestamp: payload.timestamp ?? Date.now(),
+      data: { price: payload.price },
+    });
+  });
+
+  volumeService.on("volume", (payload: { pair: string; volume: number; timestamp?: number }) => {
+    broadcastEvent({
+      type: "volume",
+      pair: payload.pair,
+      timestamp: payload.timestamp ?? Date.now(),
+      data: { volume: payload.volume },
+    });
+  });
+
+  orderBookService.on("orderbook", (payload: { pair: string; bids: unknown[]; asks: unknown[]; timestamp?: number }) => {
+    broadcastEvent({
+      type: "orderbook",
+      pair: payload.pair,
+      timestamp: payload.timestamp ?? Date.now(),
+      data: { bids: payload.bids, asks: payload.asks },
+    });
+  });
+
+  server.on("upgrade", (req: any, socket: any, head: Buffer) => {
+    const url = new URL(req.url || "", "http://localhost");
+    if (url.pathname === marketStreamPath) {
+      wss.handleUpgrade(req, socket, head);
+    }
   });
 
   return wss;
 }
 
-/**
- * GET -> /api/v1/price-updates/market-stream/metrics
- * Returns current connection and memory overhead metrics for the market stream.
- */
-router.get("/market-stream/metrics", (_req: Request, res: Response) => {
-  const stats = marketStreamHub.memoryStats();
-  res.json({
-    success: true,
-    data: {
-      clients: stats.clients,
-      estimatedBytes: stats.estimatedBytes,
-      estimatedKiB: Number((stats.estimatedBytes / 1024).toFixed(2)),
-    },
-  });
-});
-
-/**
- * POST -> /api/v1/price-updates/market-stream/publish
- * Publish a market update to all subscribed WebSocket clients.
- * Used by the internal feed ingestors.
- */
-router.post("/market-stream/publish", (req: Request, res: Response) => {
-  const { pair, channel, data, type } = req.body || {};
-  if (
-    typeof pair !== "string" ||
-    typeof channel !== "string" ||
-    !(VALID_CHANNELS as string[]).includes(channel)
-  ) {
-    return sendApiError(res, 400, "BAD_REQUEST", "pair and valid channel are required");
-  }
-  const delivered = marketStreamHub.broadcast(
-    pair.toUpperCase(),
-    channel as MarketStreamChannel,
-    data,
-    type === "snapshot" ? "snapshot" : "update",
-  );
-  res.json({ success: true, data: { delivered } });
-});
+export function getMarketStreamMetrics() {
+  return {
+    activeConnections: clients.size,
+    maxConnections: MAX_CONNECTIONS,
+  };
+}
 
 /**
  * POST /api/v1/price-updates/multi-sig/request
@@ -669,14 +548,14 @@ router.get(
       );
 
       if (!multiSigPrice) {
-        return res.status(404).json( {
+        return res.status(404).json({
           success: false,
           error: `MultiSigPrice ${multiSigPriceId} not found`,
         });
       }
 
       if (multiSigPrice.status !== "APPROVED") {
-        return res.status(400).json( {
+        return res.status(400).json({
           success: false,
           error: `MultiSigPrice ${multiSigPriceId} is not approved yet (status: ${multiSigPrice.status})`,
         });
@@ -715,7 +594,7 @@ router.post(
   async (req: Request, res: Response) => {
     try {
       const multiSigPriceId = req.params.multiSigPriceId;
-      const { memoId, stellarTxHash } = req.body;
+      const { memoId, stellarTyHash } = req.body;
 
       if (
         !multiSigPriceId ||
@@ -723,7 +602,7 @@ router.post(
         !memoId ||
         !stellarTxHash
       ) {
-        return res.status(400).json( {
+        return res.status(400).json({
           success: false,
           error:
             "Missing required fields: multiSigPriceId (in URL), memoId, stellarTxHash (in body)",

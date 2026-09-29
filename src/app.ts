@@ -51,11 +51,7 @@ import anchorsRouter from "./routes/anchors";
 import relayerKeysRouter from "./routes/relayerKeys";
 import { sendApiError } from "./lib/apiError.js";
 import metricsRouter from "./routes/metrics";
-import marketStreamRouter, {
-  marketStreamService,
-} from "./routes/marketStream";
-
-import { initSocket } from "./lib/socket";
+import marketStreamRouter from "./routes/marketStream";
 
 dotenv.config();
 
@@ -152,7 +148,7 @@ app.use("/api/v1/derived-assets", derivedAssetsRouter);
 app.use("/api/v1/sanity-check", sanityCheckRouter);
 app.use("/api/v1/cache", cacheMetricsRouter);
 
-// Issue #208 – Analytics / OHLC time-series endpoint
+// Issue #208 – Analytics / OHL  time-series endpoint
 app.use("/api/v1/analytics", analyticsRouter);
 
 // Issue #786 – Gas & CPU instruction profiler daily averages
@@ -179,8 +175,8 @@ app.use("/api/v1/soroban/simulate", sorobanSimulationRouter);
 // Issue #813 Build Automated Storage Footprint Monitor for Managed PostgreSQL
 app.use("/metrics", metricsRouter);
 
-// Issue #999 – High-Frequency Trading WebSocket Feed Aggregator
-app.use("/v1/market-stream", marketStreamRouter);
+// Issue #1091 – High-Frequency Market Stream Aggregator
+app.use("/api/v1/market-stream", marketStreamRouter);
 
 app.get("/", (req, res) => {
   res.json({
@@ -191,10 +187,6 @@ app.get("/", (req, res) => {
       health: "/health",
       liveness: "/health/liveness",
       readiness: "/health/readiness",
-      marketStream: {
-        websocket: "ws://<host>/v1/market-stream?pairs=USDC-XLM,BTC-USDC",
-        stats: "/v1/market-stream/stats",
-      },
       marketRates: {
         allRates: "/api/v1/market-rates/rates",
         singleRate: "/api/v1/market-rates/rate/:currency",
@@ -216,7 +208,7 @@ app.get("/", (req, res) => {
       },
       derivedAssets: {
         crossRate: "/api/v1/derived-assets/rate/:base/:quote",
-        ngnGhs: "/api/v1/derived-assets/njn-ghs",
+        ngnGhs: "/api/v1/derived-assets/ngn-ghs",
       },
       admin: {
         lockdown: "POST /api/admin/lockdown",
@@ -237,6 +229,11 @@ app.get("/", (req, res) => {
         requestQuote: "POST /api/v1/payment-routing/quotes",
         lockQuote: "POST /api/v1/payment-routing/quotes/:id/lock",
         getQuote: "GET /api/v1/payment-routing/quotes/:id",
+      },
+      marketStream: {
+        websocket: "ws://.../v1/market-stream?pairs=USDC-XLM,BTC-USDC",
+        metrics: "GET /api/v1/market-stream/metrics",
+        publish: "POST /api/v1/market-stream/publish",
       },
     },
   });
@@ -259,8 +256,3 @@ app.use((req, res) => {
 });
 
 export default app;
-
-export function attachMarketStream(server: import("http").Server) {
-  marketStreamService.attach(server);
-  initSocket(server);
-}

@@ -3,28 +3,41 @@ import { decode, encode } from "@msgpack/msgpack";
 /**
  * Market stream event kinds multiplexed over a single WebSocket endpoint.
  */
-export type MarketStreamEventType = "price" | "volume" | "orderbook";
+export type MarketStreamEventType =
+  | "ticker"
+  | "trade"
+  | "orderbook"
+  | "heartbeat"
+  | "error";
 
 export interface MarketStreamEvent<T = unknown> {
-  /** Event kind discriminator. */
-  t: MarketStreamEventType;
-  /** Trading pair, in canonical form (e.g. "USDC-XLM"). */
-  p: string;
-  /** Exchange timestamp in milliseconds. */
-  ts: number;
-  /** Event payload. */
-  d: T;
+  /** Event discriminator for the client to route without decoding the payload. */
+  type: MarketStreamEventType;
+  /** Trading pair, normalized as `BASE-QUOTE` (e.g. `USDC-XLM`). */
+  pair: string;
+  /** Unix epoch milliseconds when the update was emitted. */
+  timestamp: number;
+  /** Event-specific body. */
+  data: T;
 }
 
 /**
- * Pack a value into MsgPack bytes.
+ * Serialize any JS value into MsgPack bytes.
+ *
+ * This is the wire format used by the combined market-stream endpoint.
+ * MsgPack keeps per-socket memory low compared to JSON because it
+ * avoids repeated key strings and uses a compact binary encoding.
  */
 export function pack<T = unknown>(data: T): Uint8Array {
   return encode(data);
 }
 
 /**
- * Unpack MsgPack bytes or a MsgPack string back into a value.
+ * Deserialize MsgPack bytes back into a JS value.
+ *
+ * Accepts a `string` for convenience when a text frame is received
+ * (e.g. from a test harness or a non-binary transport), and `Uint8Array`
+ * or `Buffer` for the normal binary WebSocket frame path.
  */
 export function unpack<T = unknown>(payload: Uint8Array | Buffer | string): T {
   if (typeof payload === "string") {
@@ -35,7 +48,7 @@ export function unpack<T = unknown>(payload: Uint8Array | Buffer | string): T {
 }
 
 /**
- * Pack a multiplexed market stream event into MsgPack bytes.
+ * Pack a market-stream event into a single MsgPack frame.
  */
 export function packMarketEvent<T = unknown>(
   event: MarketStreamEvent<T>,
@@ -44,7 +57,7 @@ export function packMarketEvent<T = unknown>(
 }
 
 /**
- * Unpack a multiplexed market stream event from MsgPack bytes or a string.
+ * Unpack a market-stream event frame received from the combined endpoint.
  */
 export function unpackMarketEvent<T = unknown>(
   payload: Uint8Array | Buffer | string,
