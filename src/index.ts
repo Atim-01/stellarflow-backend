@@ -1,4 +1,5 @@
 import { createServer } from "http";
+import { WebSocketServer, WebSocket } from "ws";
 import dotenv from "dotenv";
 import { Horizon } from "@stellar/stellar-sdk";
 import stellarProvider from "./lib/stellarProvider";
@@ -51,6 +52,7 @@ import { storageMonitorService } from "./services/storageMonitorService";
 import { complianceScreeningWorker } from "./services/complianceScreeningWorker";
 import { startDekRotationJob } from "./jobs/dekRotationJob";
 import { ledgerEventStreamWorker } from "./services/ledgerEventStreamWorker";
+import { marketStreamAggregator } from "./services/marketStreamAggregator";
 
 // Load environment variables
 dotenv.config();
@@ -262,6 +264,7 @@ app.get("/", (req, res) => {
 // Start server
 const httpServer = createServer(app);
 initSocket(httpServer);
+const marketStreamWss = new WebSocketServer({ noServer: true });
 const liquidityRebalancingWorker = startLiquidityRebalancingWorker();
 let sorobanEventListener: SorobanEventListener | null = null;
 
@@ -351,6 +354,7 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     storageRentBumpService.stop();
     redisOperationsWorker.stop();
     complianceScreeningWorker.stop();
+    marketStreamAggregator.stop();
     getOrderBookSnapshotEngine().stop();
     VolatilityService.stop();
     ArbitrageScanner.stop();
@@ -358,6 +362,7 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     stopEnvFileWatcher?.();
     await stopBridgeServices();
 
+    marketStreamWss.close();
     await closeHttpServer();
     console.log("HTTP server closed.");
 
@@ -388,6 +393,46 @@ process.once("SIGTERM", () => {
   });
 });
 
+// High-Frequency Trading WebSocket Feed Aggregator
+// Combined price, volume, and order book streams for multiple pairs over a
+// single multiplexed endpoint: ws://.../v1/market-stream?pairs=USDC-XLM,BTC-USDC
+httpServer.on("upgrade", (request, socket, head) => {
+  let url: URL;
+  try {
+    url = new URL(request.url ?? "", "http://localhost");
+  } catch {
+    socket.destroy();
+    return;
+  }
+
+  if (url.pathname !== "/v1/market-stream") {
+    return;
+  }
+
+  const pairsParam = url.searchParams.get("pairs") ?? "";
+  const pairs = pairsParam
+    .split(",")
+    .map((p) => p.trim().toUpperCase())
+    .filter((p) => p.length > 0);
+
+  if (pairs.length === 0) {
+    socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+
+  marketStreamWss.handleUpgrade(request, socket, head, (ws) => {
+    marketStreamWss.emit("connection", ws, request, pairs);
+  });
+});
+
+marketStreamWss.on(
+  "connection",
+  (ws: WebSocket, _request: unknown, pairs: string[]) => {
+    marketStreamAggregator.registerClient(ws, pairs);
+  },
+);
+
 httpServer.listen(PORT, async () => {
   console.log(`🌊 StellarFlow Backend running on port ${PORT}`);
   console.log(
@@ -402,6 +447,9 @@ httpServer.listen(PORT, async () => {
     `✅ Readiness probe at http://localhost:${PORT}/health/readiness`,
   );
   console.log(`🔌 Socket.io ready for dashboard connections`);
+
+  marketStreamAggregator.start();
+  console.log(`⚡ Market stream aggregator started at /v1/market-stream`);
 
   redisOperationsWorker.start();
   console.log(`🧹 Redis operations worker started`);

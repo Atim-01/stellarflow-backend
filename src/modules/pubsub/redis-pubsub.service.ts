@@ -3,6 +3,17 @@ import { createClient, RedisClientType } from "redis";
 import { MessageBus } from "./message-bus.interface";
 import { pack } from "../serialization/binaryPack";
 
+/**
+ * Channel naming convention for the high-frequency market stream aggregator.
+ * Each pair gets its own channel so a single subscriber connection can
+ * multiplex price, volume and order-book updates for many pairs.
+ */
+export const MARKET_STREAM_CHANNEL_PREFIX = "market-stream";
+
+export function marketStreamChannel(pair: string): string {
+  return `${MARKET_STREAM_CHANNEL_PREFIX}:${pair.toUpperCase()}`;
+}
+
 @Injectable()
 export class RedisPubSubService implements MessageBus, OnModuleDestroy {
   private readonly logger = new Logger(RedisPubSubService.name);
@@ -32,6 +43,16 @@ export class RedisPubSubService implements MessageBus, OnModuleDestroy {
     await this.publisher.publish(channel, payload);
 
     this.logger.debug(`Published to ${channel}`);
+  }
+
+  /**
+   * Publish a multiplexed market update (price / volume / order book) for a
+   * single trading pair onto its dedicated channel. Kept intentionally lean
+   * so it can be called at high frequency without per-call allocations
+   * beyond the binary pack buffer.
+   */
+  async publishMarketUpdate<T = any>(pair: string, message: T): Promise<void> {
+    await this.publish(marketStreamChannel(pair), message);
   }
 
   async subscribe(): Promise<void> {

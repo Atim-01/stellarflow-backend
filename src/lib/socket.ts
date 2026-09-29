@@ -2,6 +2,7 @@ import { Server, Socket } from "socket.io";
 import { randomUUID } from "crypto";
 import { encode } from "@msgpack/msgpack";
 import { getApiContentSecurityPolicy } from "../middleware/securityHeadersMiddleware";
+import { registerMarketStream } from "./marketStream";
 
 interface Session {
   id: string; // connectionSessionId
@@ -116,6 +117,8 @@ export function initSocket(server: import("http").Server): Server {
         }
       }
     });
+
+    registerMarketStream(socket);
 
     socket.on(
       "identify",
