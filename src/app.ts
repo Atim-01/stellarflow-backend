@@ -51,6 +51,11 @@ import anchorsRouter from "./routes/anchors";
 import relayerKeysRouter from "./routes/relayerKeys";
 import { sendApiError } from "./lib/apiError.js";
 import metricsRouter from "./routes/metrics";
+import marketStreamRouter, {
+  marketStreamService,
+} from "./routes/marketStream";
+
+import { initSocket } from "./lib/socket";
 
 dotenv.config();
 
@@ -174,6 +179,9 @@ app.use("/api/v1/soroban/simulate", sorobanSimulationRouter);
 // Issue #813 Build Automated Storage Footprint Monitor for Managed PostgreSQL
 app.use("/metrics", metricsRouter);
 
+// Issue #999 – High-Frequency Trading WebSocket Feed Aggregator
+app.use("/v1/market-stream", marketStreamRouter);
+
 app.get("/", (req, res) => {
   res.json({
     success: true,
@@ -183,6 +191,10 @@ app.get("/", (req, res) => {
       health: "/health",
       liveness: "/health/liveness",
       readiness: "/health/readiness",
+      marketStream: {
+        websocket: "ws://<host>/v1/market-stream?pairs=USDC-XLM,BTC-USDC",
+        stats: "/v1/market-stream/stats",
+      },
       marketRates: {
         allRates: "/api/v1/market-rates/rates",
         singleRate: "/api/v1/market-rates/rate/:currency",
@@ -204,7 +216,7 @@ app.get("/", (req, res) => {
       },
       derivedAssets: {
         crossRate: "/api/v1/derived-assets/rate/:base/:quote",
-        ngnGhs: "/api/v1/derived-assets/ngn-ghs",
+        ngnGhs: "/api/v1/derived-assets/njn-ghs",
       },
       admin: {
         lockdown: "POST /api/admin/lockdown",
@@ -247,3 +259,8 @@ app.use((req, res) => {
 });
 
 export default app;
+
+export function attachMarketStream(server: import("http").Server) {
+  marketStreamService.attach(server);
+  initSocket(server);
+}
