@@ -96,4 +96,22 @@ jobs:
           path: |
             coverage.xml
             coverage-integration.xml
-          npx tsx test/circuitBreakerService.test.ts
+
+  # Issue #1085 — the same `make test` entrypoint developers run locally.
+  # Keeping the command identical is what makes a green laptop run imply a
+  # green CI run.
+  pytest-docker:
+    name: Pytest Suite (Docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run `make test`
+        run: make test
+
+      - name: Upload release-readiness report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-readiness-docker
+          path: reports/release-readiness.*
