@@ -99,3 +99,6 @@ httpx>=0.27.0
 
 # Docker test containers for PostgreSQL, Redis
 testcontainers[postgres,redis]>=4.4.0
+
+# Memory-mapped key-value store for Soroban instance storage caching
+lmdb>=2.0.0
