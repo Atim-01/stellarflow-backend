@@ -42,7 +42,6 @@ import { governanceWebhookBroadcaster } from "./services/governanceWebhookBroadc
 import { getRegionalHealthService } from "./services/regionalHealthService";
 import { storageRentBumpService } from "./services/storageRentBumpService";
 import { getOrderBookSnapshotEngine } from "./services/orderBookSnapshotEngine";
-import { getRegionalHealthService } from "./services/regionalHealthService";
 import { redisOperationsWorker } from "./services/redisOperationsWorker";
 import { initializeBridgeServices, stopBridgeServices } from "./services/bridgeIntegration";
 import { VolatilityService } from "./services/volatility.service";
@@ -51,6 +50,9 @@ import { storageMonitorService } from "./services/storageMonitorService";
 import { complianceScreeningWorker } from "./services/complianceScreeningWorker";
 import { startDekRotationJob } from "./jobs/dekRotationJob";
 import { ledgerEventStreamWorker } from "./services/ledgerEventStreamWorker";
+import { taxReportExportWorker } from "./jobs/taxReportExportWorker";
+import { sorobanStateRootInspectorWorker } from "./services/sorobanStateRootInspectorWorker";
+import { systemHealthWatchdog } from "./services/systemHealthWatchdog";
 
 // Load environment variables
 dotenv.config();
@@ -269,7 +271,7 @@ systemHealthWatchdog.registerWorker({
   name: "redis-operations",
   getLastHeartbeatAt: () => redisOperationsWorker.getLastHeartbeatAt(),
   heartbeatTimeoutMs: redisOperationsWorker.getHeartbeatTimeoutMs(),
-  restart: () => {
+  restart: async () => {
     redisOperationsWorker.stop();
     await ledgerEventStreamWorker.stop();
     redisOperationsWorker.start();
@@ -287,6 +289,26 @@ if (liquidityRebalancingWorker) {
     },
   });
 }
+
+systemHealthWatchdog.registerWorker({
+  name: "soroban-state-root-inspector",
+  getLastHeartbeatAt: () => sorobanStateRootInspectorWorker.getLastHeartbeatAt(),
+  heartbeatTimeoutMs: sorobanStateRootInspectorWorker.getHeartbeatTimeoutMs(),
+  restart: () => {
+    sorobanStateRootInspectorWorker.stop();
+    sorobanStateRootInspectorWorker.start();
+  },
+});
+
+systemHealthWatchdog.registerWorker({
+  name: "tax-report-export",
+  getLastHeartbeatAt: () => taxReportExportWorker.getLastHeartbeatAt(),
+  heartbeatTimeoutMs: taxReportExportWorker.getHeartbeatTimeoutMs(),
+  restart: () => {
+    void taxReportExportWorker.stop();
+    taxReportExportWorker.start();
+  },
+});
 
 // FIX 1: Typed as nullable — constructor is not called at module level,
 // so a missing secret env var won't crash the process before the server starts.
@@ -351,6 +373,8 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     storageRentBumpService.stop();
     redisOperationsWorker.stop();
     complianceScreeningWorker.stop();
+    sorobanStateRootInspectorWorker.stop();
+    await taxReportExportWorker.stop();
     getOrderBookSnapshotEngine().stop();
     VolatilityService.stop();
     ArbitrageScanner.stop();
@@ -413,6 +437,22 @@ httpServer.listen(PORT, async () => {
 
   complianceScreeningWorker.start();
   console.log(`🛡️ Compliance screening worker started`);
+
+  // Issue #1067 – Verify off-chain Merkle state against Soroban ledger roots
+  try {
+    sorobanStateRootInspectorWorker.start();
+    console.log(`🛡️ Soroban state root inspector worker started`);
+  } catch (err) {
+    console.error("Failed to start Soroban state root inspector worker:", err);
+  }
+
+  // Issue #1009 – Background tax report export worker
+  try {
+    taxReportExportWorker.start();
+    console.log(`🧾 Tax report export worker started`);
+  } catch (err) {
+    console.error("Failed to start tax report export worker:", err);
+  }
 
   // Start PostgreSQL storage footprint monitor (Issue #813)
   try {

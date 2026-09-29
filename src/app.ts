@@ -49,6 +49,10 @@ import userConversionsRouter from "./routes/userConversions";
 import paymentRoutingRouter from "./routes/paymentRouting";
 import anchorsRouter from "./routes/anchors";
 import relayerKeysRouter from "./routes/relayerKeys";
+import riskRouter from "./routes/risk";
+import securityRouter from "./routes/security";
+import stellarTomlRouter from "./routes/stellarToml";
+import taxReportRouter from "./routes/taxReport";
 import { sendApiError } from "./lib/apiError.js";
 import metricsRouter from "./routes/metrics";
 
@@ -80,6 +84,9 @@ app.use(tracingMiddleware);
 app.use(axiosTracingMiddleware);
 
 app.use("/health", healthRouter);
+
+// Issue #1040 – SEP-01 stellar.toml metadata served from the well-known path.
+app.use("/.well-known", stellarTomlRouter);
 
 app.use("/api/v1/docs", swaggerUi.serve);
 
@@ -165,6 +172,15 @@ app.use("/api/v1/payment-routing", paymentRoutingRouter);
 
 // Issue #931 – Anchor SEP-24 / SEP-31 Webhook Ingestion Service
 app.use("/api/v1/anchors", anchorsRouter);
+
+// Issue #1003 – Dynamic vault collateral valuation factors
+app.use("/api/v1/risk", riskRouter);
+
+// Issue #1067 – Soroban state root inspection status
+app.use("/api/v1/security", securityRouter);
+
+// Issue #1009 – Tax-compliant user transaction history exports
+app.use("/api/v1/users", taxReportRouter);
 
 // Issue #836 – Soroban Contract Instruction & Storage Rent Estimator
 // eslint-disable-next-line no-undef
