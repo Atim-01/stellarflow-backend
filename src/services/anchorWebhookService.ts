@@ -24,6 +24,7 @@
 import crypto from "crypto";
 import prisma from "../lib/prisma";
 import { createFetcherLogger } from "../utils/logger";
+import { dispatchSep31CompletionCallback } from "./sep31Service";
 
 export interface AnchorWebhookPayload {
   transaction?: {
@@ -223,6 +224,17 @@ export class AnchorWebhookService {
         },
         select: { id: true, status: true },
       });
+
+      if (updated.status === "COMPLETED") {
+        void dispatchSep31CompletionCallback(transactionId, "completed").catch(
+          (error) => {
+            this.logger.error("SEP-31 completion callback failed", {
+              transactionId,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          },
+        );
+      }
 
       this.logger.info("Transaction status transitioned", {
         transactionId,
