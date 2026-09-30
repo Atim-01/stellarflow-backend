@@ -5,6 +5,7 @@ import { BackpressureManager, PacketPriority } from "../queue/backpressure";
 import { verifyBridgeEventSignatures } from "./bridgeSignatureVerification";
 import { stageSorobanMintTransaction } from "./bridgeMintingService";
 import { enqueueBridgeOperation } from "./bridgeQueueService";
+import type { CollateralLockedEvent } from "./collateralLockedEvent";
 
 export interface BridgeEventData {
   chainId: number;
@@ -30,6 +31,45 @@ export interface ChainConfig {
   rpcUrl?: string;
   bridgeContract?: string;
   isActive: boolean;
+}
+
+/** Persists a normalized cross-chain lock and stages its Soroban mint. */
+export async function persistCollateralLockedEvent(
+  event: CollateralLockedEvent,
+): Promise<void> {
+  const chain = await prisma.bridgeChain.findUnique({
+    where: { chainId: event.chainId },
+  });
+  if (!chain) throw new Error(`Bridge chain ${event.chainId} is not configured`);
+
+  const bridgeEvent = await prisma.bridgeEvent.create({
+    data: {
+      chainId: chain.id,
+      eventType: "COLLATERAL_LOCK",
+      transactionHash: event.transactionHash,
+      tokenAmount: event.tokenAmount,
+      fromAddress: event.fromAddress,
+      destinationChainId: event.destinationChainId,
+      destinationAddress: event.destinationAddress,
+      eventTimestamp: event.eventTimestamp,
+      status: "PENDING",
+    },
+  });
+  if (!(await verifyBridgeEventSignatures(bridgeEvent.id))) return;
+
+  const stagedTx = await stageSorobanMintTransaction(bridgeEvent);
+  if (!stagedTx) return;
+  await enqueueBridgeOperation({
+    bridgeEventId: bridgeEvent.id,
+    sorobanContract: stagedTx.contractId,
+    mintAmount: stagedTx.amount,
+    recipientAddress: stagedTx.recipient,
+    priority: 5,
+  });
+  await prisma.bridgeEvent.update({
+    where: { id: bridgeEvent.id },
+    data: { status: "STAGED" },
+  });
 }
 
 export class BridgeEventListener {
