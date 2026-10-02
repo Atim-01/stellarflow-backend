@@ -21,6 +21,7 @@ from app.services.webhook_retry import (
     WEBHOOK_DLQ_QUEUE,
     run_delivery,
 )
+from app.security.proof_encryption import proof_encryptor_from_environment
 
 class DatabaseTask(Task):
     """Base task that exposes the configured PostgreSQL connection string."""
@@ -740,8 +741,9 @@ async def _index_range(start_ledger: int, end_ledger: int) -> dict[str, int]:
             )
 
         async with async_session_factory() as session:
-            note_parser = NoteParser()
-            merkle_service = MerkleService()
+            proof_encryptor = proof_encryptor_from_environment()
+            note_parser = NoteParser(proof_encryptor)
+            merkle_service = MerkleService(proof_encryptor)
 
             commitments_indexed, nullifiers_indexed = await note_parser.parse_batch(session, events)
 
@@ -793,6 +795,49 @@ def index_shielded_notes_range(
     """Celery task to index shielded notes in a given ledger range."""
     return asyncio.run(_index_range(start_ledger, end_ledger))
 
+
+
+# ---------------------------------------------------------------------------
+# Issue #979 — Asynchronous S3 Media & PDF Export Cleaner Worker
+# ---------------------------------------------------------------------------
+
+
+@celery_app.task(
+    bind=True,
+    base=DatabaseTask,
+    name="app.tasks.purge_s3_temp_exports",
+    autoretry_for=(OSError,),
+    retry_backoff=True,
+    max_retries=3,
+)
+def purge_s3_temp_exports(
+    self: DatabaseTask,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Daily worker that scans S3 and deletes temporary CSV/PDF export files.
+
+    Purges objects in the ``stellarflow-temp-exports`` bucket (configurable via
+    ``S3_TEMP_EXPORTS_BUCKET``) whose ``LastModified`` timestamp is older than
+    24 hours (configurable via ``S3_TEMP_EXPORTS_TTL_HOURS``).
+
+    Logs total objects deleted and total storage space reclaimed on each run.
+
+    Parameters
+    ----------
+    dry_run:
+        When ``True`` the task scans and reports stale objects without actually
+        deleting them.  Overridden by the ``S3_CLEANER_DRY_RUN`` env var when
+        both are set to ``True``.
+
+    Returns
+    -------
+    dict[str, Any]
+        Structured cleanup run summary (bucket, objects_deleted,
+        bytes_reclaimed, errors, timestamps, …).
+    """
+    from app.services.s3_export_cleaner import run_s3_export_cleanup
+
+    return run_s3_export_cleanup(dry_run=dry_run)
 
 
 @celery_app.task(
