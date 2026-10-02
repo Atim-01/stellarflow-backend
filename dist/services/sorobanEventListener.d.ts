@@ -33,6 +33,14 @@ export declare class SorobanEventListener {
      * Expected event data:   { choice: "For"|"Against"|"Abstain", weight: string }
      */
     private pollGovernanceVoteEvents;
+    /**
+     * Polls Soroban for Pause and CircuitBreakerTriggered events emitted by the contract
+     * and dispatches webhook notifications to registered endpoints.
+     *
+     * Expected event topics: ["Pause"] or ["CircuitBreakerTriggered", reason]
+     * Expected event data: varies by event type
+     */
+    private pollCircuitBreakerEvents;
     private extractMemoId;
     private parseOperations;
     stop(): void;

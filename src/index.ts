@@ -1,5 +1,4 @@
 import { createServer } from "http";
-import compression from "compression";
 import dotenv from "dotenv";
 import { Horizon } from "@stellar/stellar-sdk";
 import stellarProvider from "./lib/stellarProvider";
@@ -39,6 +38,7 @@ import { priceAggregatorService } from "./services/priceAggregatorService";
 import { contractSanityCheckService } from "./services/contractSanityCheckService";
 import { getCircuitBreakerService } from "./services/circuitBreakerService";
 import { governanceTimelockService } from "./services/governanceTimelockService";
+import { governanceWebhookBroadcaster } from "./services/governanceWebhookBroadcaster";
 import { getRegionalHealthService } from "./services/regionalHealthService";
 import { storageRentBumpService } from "./services/storageRentBumpService";
 import { getOrderBookSnapshotEngine } from "./services/orderBookSnapshotEngine";
@@ -50,6 +50,8 @@ import { ArbitrageScanner } from "./services/arbitrageScanner";
 import { storageMonitorService } from "./services/storageMonitorService";
 import { complianceScreeningWorker } from "./services/complianceScreeningWorker";
 import { startDekRotationJob } from "./jobs/dekRotationJob";
+import { ledgerEventStreamWorker } from "./services/ledgerEventStreamWorker";
+import { getEventBusService } from "./services/eventBus/eventBusService";
 
 // Load environment variables
 dotenv.config();
@@ -270,6 +272,7 @@ systemHealthWatchdog.registerWorker({
   heartbeatTimeoutMs: redisOperationsWorker.getHeartbeatTimeoutMs(),
   restart: () => {
     redisOperationsWorker.stop();
+    await ledgerEventStreamWorker.stop();
     redisOperationsWorker.start();
   },
 });
@@ -290,6 +293,11 @@ if (liquidityRebalancingWorker) {
 // so a missing secret env var won't crash the process before the server starts.
 let gasBalanceMonitorService: GasBalanceMonitorService | null = null;
 const circuitBreakerService = getCircuitBreakerService();
+
+// Issue #1055 – Event bus queue depth metrics + backpressure alert bot + worker
+// autoscaler. Constructed here (rather than at module level) so importing this
+// file does not open broker connections before the process is ready.
+const eventBusService = getEventBusService();
 
 let isShuttingDown = false;
 let stopEnvFileWatcher: (() => void) | undefined;
@@ -335,10 +343,14 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     sorobanEventListener?.stop();
     multiSigSubmissionService.stop();
     governanceTimelockService.stop();
+    governanceWebhookBroadcaster.stop();
     liquidityRebalancingWorker?.stop();
     apyWorker.stop();
     storageMonitorService.stop(); // <--- ADDED
     systemHealthWatchdog.stop();
+    // Issue #1055 – stop the queue monitor before Redis/RabbitMQ go away so the
+    // final cycle is not a burst of failed probes.
+    await eventBusService.stop();
     // FIX 2: Optional chaining — safe to call even if service never started
     gasBalanceMonitorService?.stop();
     circuitBreakerService.stop();
@@ -350,6 +362,7 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     complianceScreeningWorker.stop();
     getOrderBookSnapshotEngine().stop();
     VolatilityService.stop();
+    DynamicFeeAdjusterService.stop();
     ArbitrageScanner.stop();
     stopConfigWatcher();
     stopEnvFileWatcher?.();
@@ -402,6 +415,11 @@ httpServer.listen(PORT, async () => {
 
   redisOperationsWorker.start();
   console.log(`🧹 Redis operations worker started`);
+
+  void ledgerEventStreamWorker.start().catch((err) => {
+    console.error("Failed to start ledger event stream worker:", err);
+  });
+  console.log(`📡 Ledger event stream worker started`);
 
   complianceScreeningWorker.start();
   console.log(`🛡️ Compliance screening worker started`);
@@ -528,6 +546,18 @@ httpServer.listen(PORT, async () => {
     );
   }
 
+  try {
+    governanceWebhookBroadcaster.start().catch((err: Error) => {
+      console.error("Failed to start governance webhook broadcaster:", err);
+    });
+    console.log("Governance webhook broadcaster started");
+  } catch (err) {
+    console.warn(
+      "Governance webhook broadcaster not started:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+
   // Start background hourly average job
   try {
     hourlyAverageService.start().catch((err: Error) => {
@@ -620,11 +650,30 @@ httpServer.listen(PORT, async () => {
     console.error("Failed to start volatility service:", err);
   }
 
+  // Start Dynamic Fee Adjuster
+  try {
+    DynamicFeeAdjusterService.start();
+  } catch (err) {
+    console.error("Failed to start dynamic fee adjuster:", err);
+  }
+
   // Start Arbitrage Scanner
   try {
     ArbitrageScanner.start();
   } catch (err) {
     console.error("Failed to start arbitrage scanner:", err);
+  }
+
+  // Issue #1055 – Event bus queue depth metrics, backpressure alert bot and
+  // worker autoscaler. Started last so the first cycle observes a fully
+  // warmed-up ingestion path.
+  try {
+    eventBusService.start();
+    console.log(
+      `📊 Event bus monitor started (${eventBusService.getConfig().pollIntervalMs}ms interval, alert threshold ${eventBusService.getConfig().alert.threshold})`,
+    );
+  } catch (err) {
+    console.error("Failed to start event bus monitor:", err);
   }
 });
 
