@@ -50,6 +50,7 @@ import paymentRoutingRouter from "./routes/paymentRouting";
 import anchorsRouter from "./routes/anchors";
 import sep31Router from "./routes/sep31";
 import relayerKeysRouter from "./routes/relayerKeys";
+import eventBusRouter from "./routes/eventBus";
 import { sendApiError } from "./lib/apiError.js";
 import metricsRouter from "./routes/metrics";
 
@@ -135,6 +136,14 @@ app.use(
   adminMiddleware,
   adminRateLimitMiddleware,
   governanceWebhooksRouter,
+);
+
+// Issue #1055 – Internal event bus metrics and queue backpressure alert bot
+app.use(
+  "/api/v1/admin/event-bus",
+  adminMiddleware,
+  adminRateLimitMiddleware,
+  eventBusRouter,
 );
 
 app.use("/api/v1/market-rates", marketRatesRouter);

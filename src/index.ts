@@ -51,6 +51,7 @@ import { storageMonitorService } from "./services/storageMonitorService";
 import { complianceScreeningWorker } from "./services/complianceScreeningWorker";
 import { startDekRotationJob } from "./jobs/dekRotationJob";
 import { ledgerEventStreamWorker } from "./services/ledgerEventStreamWorker";
+import { getEventBusService } from "./services/eventBus/eventBusService";
 
 // Load environment variables
 dotenv.config();
@@ -293,6 +294,11 @@ if (liquidityRebalancingWorker) {
 let gasBalanceMonitorService: GasBalanceMonitorService | null = null;
 const circuitBreakerService = getCircuitBreakerService();
 
+// Issue #1055 – Event bus queue depth metrics + backpressure alert bot + worker
+// autoscaler. Constructed here (rather than at module level) so importing this
+// file does not open broker connections before the process is ready.
+const eventBusService = getEventBusService();
+
 let isShuttingDown = false;
 let stopEnvFileWatcher: (() => void) | undefined;
 const stopConfigWatcher = watchConfig((cfg) => {
@@ -342,6 +348,9 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     apyWorker.stop();
     storageMonitorService.stop(); // <--- ADDED
     systemHealthWatchdog.stop();
+    // Issue #1055 – stop the queue monitor before Redis/RabbitMQ go away so the
+    // final cycle is not a burst of failed probes.
+    await eventBusService.stop();
     // FIX 2: Optional chaining — safe to call even if service never started
     gasBalanceMonitorService?.stop();
     circuitBreakerService.stop();
@@ -645,6 +654,18 @@ httpServer.listen(PORT, async () => {
     ArbitrageScanner.start();
   } catch (err) {
     console.error("Failed to start arbitrage scanner:", err);
+  }
+
+  // Issue #1055 – Event bus queue depth metrics, backpressure alert bot and
+  // worker autoscaler. Started last so the first cycle observes a fully
+  // warmed-up ingestion path.
+  try {
+    eventBusService.start();
+    console.log(
+      `📊 Event bus monitor started (${eventBusService.getConfig().pollIntervalMs}ms interval, alert threshold ${eventBusService.getConfig().alert.threshold})`,
+    );
+  } catch (err) {
+    console.error("Failed to start event bus monitor:", err);
   }
 });
 
