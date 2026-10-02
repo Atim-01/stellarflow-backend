@@ -14,6 +14,7 @@ import prisma from "../lib/prisma";
 import stellarProvider from "../lib/stellarProvider";
 import { StellarService } from "./stellarService";
 import { notificationService } from "./notificationService";
+import { governanceWebhookBroadcaster } from "./governanceWebhookBroadcaster";
 import { logger } from "../utils/logger";
 import { xdr } from "@stellar/stellar-sdk";
 
@@ -149,12 +150,19 @@ export class GovernanceTimelockService {
   /** Tracks the highest ledger sequence we have already indexed. */
   private lastIndexedLedger = 0;
 
+  private readonly defaultGracePeriodMs: number;
+
   constructor(
     pollIntervalMs = Number(process.env.GOVERNANCE_POLL_INTERVAL_MS) || 15_000,
     stellarService = new StellarService(),
+    private readonly webhookBroadcaster = governanceWebhookBroadcaster,
+    defaultGracePeriodMs = Number(
+      process.env.GOVERNANCE_TIMELOCK_GRACE_PERIOD_MS,
+    ) || 7 * 24 * 60 * 60 * 1000,
   ) {
     this.pollIntervalMs = pollIntervalMs;
     this.stellarService = stellarService;
+    this.defaultGracePeriodMs = defaultGracePeriodMs;
   }
 
   // -------------------------------------------------------------------------
@@ -197,6 +205,7 @@ export class GovernanceTimelockService {
     if (!contractId) return;
 
     await this.indexContractEvents(contractId);
+    await this.cleanExpiredProposals();
     await this.notifyReadyProposals();
     await this.checkAndExecute(contractId);
   }
@@ -275,7 +284,10 @@ export class GovernanceTimelockService {
             txHash,
           );
         } else if (eventName === "TimelockActionExecuted") {
-          await this.handleTimelockActionExecuted(proposalId);
+          await this.handleTimelockActionExecuted(
+            proposalId,
+            event.contractId ?? contractId,
+          );
         }
 
         if (ledgerSeq > this.lastIndexedLedger) {
@@ -336,21 +348,38 @@ export class GovernanceTimelockService {
   /** Mark a GovernanceProposal as Executed when its TimelockActionExecuted event arrives. */
   private async handleTimelockActionExecuted(
     proposalId: string,
+    contractId?: string,
   ): Promise<void> {
+    const executedAt = new Date();
+
     await prisma.governanceProposal
       .update({
         where: { proposalId },
         data: {
           status: "Executed",
-          executedAt: new Date(),
-          updatedAt: new Date(),
+          executedAt,
+          updatedAt: executedAt,
         },
       })
-      .catch((err) => {
+      .catch((err: unknown) => {
         // Proposal row might not exist if we missed the ProposalQueued event —
         // log and continue rather than crashing.
         logger.warn(
           `[GovernanceTimelockService] Could not mark ${proposalId} Executed (row may not exist):`,
+          err,
+        );
+      });
+
+    void this.webhookBroadcaster
+      .broadcastProposalExecuted({
+        proposalId,
+        contractId: contractId ?? null,
+        status: "Executed",
+        executedAt,
+      })
+      .catch((err) => {
+        logger.warn(
+          `[GovernanceTimelockService] Webhook broadcast failed for ${proposalId}:`,
           err,
         );
       });
@@ -361,11 +390,137 @@ export class GovernanceTimelockService {
   }
 
   // -------------------------------------------------------------------------
+  // Task – Clean Expired Timelocked Proposals
+  // -------------------------------------------------------------------------
+
+  /**
+   * Query queued proposals where t_current > t_execution + T_grace_period
+   * (i.e. expiresAt < t_current - gracePeriodMs).
+   *
+   * Transitions their status to 'Expired' in the database, emits the
+   * `ProposalExecutionExpired` governance event log, and broadcasts webhooks.
+   */
+  async cleanExpiredProposals(
+    gracePeriodMs: number = this.defaultGracePeriodMs,
+  ): Promise<{ processed: number; expiredIds: string[] }> {
+    const now = new Date();
+    const thresholdDate = new Date(now.getTime() - gracePeriodMs);
+
+    try {
+      const expiredProposals = await prisma.$queryRaw<TimelockedProposal[]>`
+        SELECT "id", "proposalId", "contractId", "expiresAt"
+        FROM "GovernanceProposal"
+        WHERE "status" = 'Queued'
+          AND "expiresAt" < ${thresholdDate}
+        ORDER BY "expiresAt" ASC
+        LIMIT 100
+      `;
+
+      const expiredIds: string[] = [];
+
+      for (const proposal of expiredProposals) {
+        try {
+          const updatedRows = await prisma.$executeRaw`
+            UPDATE "GovernanceProposal"
+            SET "status" = 'Expired', "updatedAt" = NOW()
+            WHERE "id" = ${proposal.id} AND "status" = 'Queued'
+          `;
+
+          if (Number(updatedRows) > 0) {
+            expiredIds.push(proposal.proposalId);
+
+            logger.info(
+              `[GovernanceTimelockService] ProposalExecutionExpired: ${proposal.proposalId}`,
+              {
+                event: "ProposalExecutionExpired",
+                proposalId: proposal.proposalId,
+                contractId: proposal.contractId,
+                expiresAt: proposal.expiresAt,
+                gracePeriodMs,
+                expiredAt: now,
+              },
+            );
+
+            // Record governance event log in TimelockEvent
+            const eventType = "ProposalExecutionExpired";
+            const txHash = `expired-${proposal.proposalId}-${now.getTime()}`;
+            await prisma.timelockEvent
+              .upsert({
+                where: {
+                  txHash_eventType_proposalId: {
+                    txHash,
+                    eventType,
+                    proposalId: proposal.proposalId,
+                  },
+                },
+                create: {
+                  eventType,
+                  proposalId: proposal.proposalId,
+                  contractId: proposal.contractId,
+                  ledgerSeq: this.lastIndexedLedger,
+                  txHash,
+                  topics: JSON.stringify([eventType, proposal.proposalId]),
+                  value: JSON.stringify({
+                    proposalId: proposal.proposalId,
+                    contractId: proposal.contractId,
+                    expiresAt: proposal.expiresAt,
+                    gracePeriodMs,
+                    expiredAt: now.toISOString(),
+                  }),
+                },
+                update: {},
+              })
+              .catch((err) => {
+                logger.warn(
+                  `[GovernanceTimelockService] Failed to record TimelockEvent for expired ${proposal.proposalId}:`,
+                  err,
+                );
+              });
+
+            // Webhook broadcast
+            void this.webhookBroadcaster
+              .broadcastProposalExpired({
+                proposalId: proposal.proposalId,
+                contractId: proposal.contractId,
+                status: "Expired",
+                expiresAt: proposal.expiresAt,
+                reason: "timelock_execution_window_expired",
+              })
+              .catch((err) => {
+                logger.warn(
+                  `[GovernanceTimelockService] Webhook broadcast failed for expired proposal ${proposal.proposalId}:`,
+                  err,
+                );
+              });
+          }
+        } catch (err) {
+          logger.error(
+            `[GovernanceTimelockService] Failed to expire proposal ${proposal.proposalId}:`,
+            err,
+          );
+        }
+      }
+
+      return {
+        processed: expiredProposals.length,
+        expiredIds,
+      };
+    } catch (err) {
+      logger.error(
+        "[GovernanceTimelockService] Error during cleanExpiredProposals:",
+        err,
+      );
+      return { processed: 0, expiredIds: [] };
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Task 4 – Fire execution-ready notifications
   // -------------------------------------------------------------------------
 
   async notifyReadyProposals(): Promise<void> {
     const now = new Date();
+    const thresholdDate = new Date(now.getTime() - this.defaultGracePeriodMs);
 
     // Find queued proposals whose timelock window has passed and that have
     // not yet been notified (or need a follow-up notification).
@@ -374,11 +529,14 @@ export class GovernanceTimelockService {
       FROM "GovernanceProposal"
       WHERE "status" = 'Queued'
         AND "expiresAt" <= ${now}
+        AND "expiresAt" >= ${thresholdDate}
         AND "executionReadyNotifiedAt" IS NULL
       ORDER BY "expiresAt" ASC
     `;
 
     for (const proposal of pending) {
+      if (Date.now() > proposal.expiresAt.getTime() + this.defaultGracePeriodMs)
+        continue;
       try {
         await notificationService.sendGovernanceTimelockReadyAlert({
           proposalId: proposal.proposalId,
@@ -394,6 +552,21 @@ export class GovernanceTimelockService {
             "updatedAt"                = NOW()
           WHERE "id" = ${proposal.id}
         `;
+
+        void this.webhookBroadcaster
+          .broadcastProposalExpired({
+            proposalId: proposal.proposalId,
+            contractId: proposal.contractId,
+            status: "Queued",
+            expiresAt: proposal.expiresAt,
+            reason: "timelock_expired",
+          })
+          .catch((err) => {
+            logger.warn(
+              `[GovernanceTimelockService] Webhook broadcast failed for ${proposal.proposalId}:`,
+              err,
+            );
+          });
 
         logger.info(
           `[GovernanceTimelockService] Notified ready proposal: ${proposal.proposalId}`,
@@ -419,15 +592,20 @@ export class GovernanceTimelockService {
       .limit(1)
       .call();
     const ledgerTimestamp = new Date(ledger.records[0]!.closed_at);
+    const thresholdDate = new Date(Date.now() - this.defaultGracePeriodMs);
 
     const proposals = await prisma.$queryRaw<TimelockedProposal[]>`
       SELECT "id", "proposalId", "contractId", "expiresAt"
       FROM "GovernanceProposal"
       WHERE "status" = 'Queued' AND "expiresAt" <= ${ledgerTimestamp}
+        AND "expiresAt" >= ${thresholdDate}
       ORDER BY "expiresAt" ASC
     `;
 
     for (const proposal of proposals) {
+      // A proposal can age out while earlier submissions are awaiting the network.
+      if (Date.now() > proposal.expiresAt.getTime() + this.defaultGracePeriodMs)
+        continue;
       try {
         const transactionHash =
           await this.stellarService.executeGovernanceProposal(
@@ -439,6 +617,22 @@ export class GovernanceTimelockService {
           SET "status" = 'Executed', "transactionHash" = ${transactionHash}, "executedAt" = NOW(), "updatedAt" = NOW()
           WHERE "id" = ${proposal.id} AND "status" = 'Queued'
         `;
+
+        void this.webhookBroadcaster
+          .broadcastProposalExecuted({
+            proposalId: proposal.proposalId,
+            contractId: proposal.contractId,
+            status: "Executed",
+            transactionHash,
+            expiresAt: proposal.expiresAt,
+            executedAt: new Date(),
+          })
+          .catch((err) => {
+            logger.warn(
+              `[GovernanceTimelockService] Webhook broadcast failed for ${proposal.proposalId}:`,
+              err,
+            );
+          });
       } catch (err) {
         logger.error(
           `[GovernanceTimelockService] Failed to execute proposal ${proposal.proposalId}:`,
