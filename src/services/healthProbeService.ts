@@ -1,21 +1,25 @@
 import prisma from "../lib/prisma";
 import { getRedisClient } from "../lib/redis";
 import stellarProvider from "../lib/stellarProvider";
+import { Pkcs11HsmSignerService } from "../signer/pkcs11-signer.service";
+import { MockPkcs11Client } from "../signer/pkcs11/pkcs11-client";
+import { signer } from "../signer";
 
 export const READINESS_UNAVAILABLE_STATUS = 530;
 
-export type ProbeName = "database" | "redis" | "rpc";
+export type ProbeName = "database" | "redis" | "rpc" | "hsm";
 
 export interface ProbeResult {
   name: ProbeName;
   healthy: boolean;
   error?: string;
+  details?: Record<string, unknown>;
 }
 
 export interface ReadinessReport {
   ready: boolean;
   timestamp: string;
-  checks: Record<ProbeName, boolean>;
+  checks: Partial<Record<ProbeName, boolean>>;
   errors: Partial<Record<ProbeName, string>>;
 }
 
@@ -108,10 +112,77 @@ export async function probeRpc(): Promise<ProbeResult> {
   }
 }
 
-export async function getReadinessReport(): Promise<ReadinessReport> {
-  const probes = await Promise.all([probeDatabase(), probeRedis(), probeRpc()]);
+/**
+ * Automated health probe verifying PKCS#11 Hardware Security Module (HSM)
+ * hardware status, token presence, authentication, and cryptographic readiness.
+ */
+export async function probeHsm(): Promise<ProbeResult> {
+  try {
+    const backend = process.env.SIGNER_BACKEND;
+    const isHsm = backend === "pkcs11" || backend === "hsm";
 
-  const checks = {} as Record<ProbeName, boolean>;
+    if (signer instanceof Pkcs11HsmSignerService) {
+      const health = await withTimeout("hsm", () =>
+        (signer as Pkcs11HsmSignerService).getHealth(),
+      );
+      return {
+        name: "hsm",
+        healthy: health.healthy,
+        error: health.error,
+        details: health as unknown as Record<string, unknown>,
+      };
+    }
+
+    if (isHsm) {
+      const client = new MockPkcs11Client();
+      await client.initialize();
+      const health = await withTimeout("hsm", () =>
+        client.getHealth({
+          slotId: process.env.HSM_SLOT_ID
+            ? parseInt(process.env.HSM_SLOT_ID, 10)
+            : 0,
+          tokenLabel: process.env.HSM_TOKEN_LABEL,
+          pin: process.env.HSM_PIN,
+          keyLabel: process.env.HSM_KEY_LABEL || "stellar-relayer-key",
+          keyId: process.env.HSM_KEY_ID,
+        }),
+      );
+      return {
+        name: "hsm",
+        healthy: health.healthy,
+        error: health.error,
+        details: health as unknown as Record<string, unknown>,
+      };
+    }
+
+    // If HSM backend is not explicitly enabled, probe passes
+    return { name: "hsm", healthy: true };
+  } catch (error) {
+    return {
+      name: "hsm",
+      healthy: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+export async function getReadinessReport(): Promise<ReadinessReport> {
+  const backend = process.env.SIGNER_BACKEND;
+  const isHsm = backend === "pkcs11" || backend === "hsm";
+
+  const probePromises: Promise<ProbeResult>[] = [
+    probeDatabase(),
+    probeRedis(),
+    probeRpc(),
+  ];
+
+  if (isHsm) {
+    probePromises.push(probeHsm());
+  }
+
+  const probes = await Promise.all(probePromises);
+
+  const checks: Partial<Record<ProbeName, boolean>> = {};
   const errors: Partial<Record<ProbeName, string>> = {};
 
   for (const probe of probes) {

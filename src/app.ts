@@ -14,6 +14,7 @@ import { maintenanceMiddleware } from "./middleware/maintenanceMiddleware";
 import { rateLimitMiddleware } from "./middleware/rateLimitMiddleware";
 import { graphqlQueryGuard } from "./middleware/graphqlQueryGuard";
 import { applyHttpSecurity } from "./middleware/httpSecurity";
+import { compressionMiddleware } from "./middleware/compressionMiddleware";
 import {
   tracingMiddleware,
   axiosTracingMiddleware,
@@ -37,6 +38,7 @@ import analyticsRouter from "./routes/analytics";
 import gasProfileRouter from "./routes/gasProfile";
 import zkRouter from "./routes/zk";
 import governanceRouter from "./routes/governance";
+import governanceWebhooksRouter from "./routes/governanceWebhooks";
 import healthRouter from "./routes/health";
 import proofRouter from "./routes/proof";
 import ordersRouter from "./routes/orders";
@@ -46,15 +48,26 @@ import remittanceRouter from "./routes/remittance";
 import userConversionsRouter from "./routes/userConversions";
 import paymentRoutingRouter from "./routes/paymentRouting";
 import anchorsRouter from "./routes/anchors";
+import sep31Router from "./routes/sep31";
 import relayerKeysRouter from "./routes/relayerKeys";
+import eventBusRouter from "./routes/eventBus";
 import { sendApiError } from "./lib/apiError.js";
 import metricsRouter from "./routes/metrics";
+import watchlistRouter from "./routes/watchlist";
+import treasuryRouter from "./routes/treasury";
 
 dotenv.config();
 
 const app = express();
 
 app.use(morgan("dev"));
+
+// Issue #1015 – SEP-24 interactive webview. Browser-facing HTML opened by end
+// users, so it is mounted ahead of the JSON-API security chain below: that chain
+// sends `frame-ancestors 'none'` and a CORS allowlist that would block wallets
+// from framing it and same-origin form posts. The router applies its own
+// nonce-based CSP, rate limiting and signed-token authentication.
+app.use("/sep24", sep24InteractiveRouter);
 
 // Issue #792 – Security headers + strict CORS allowlist. Registered before
 // everything else so the headers reach every response, including short-circuit
@@ -63,6 +76,9 @@ applyHttpSecurity(app);
 
 // Maintenance mode middleware: must be early in the chain
 app.use(maintenanceMiddleware);
+
+// Dynamic payload compression middleware: gzip and brotli (> 1KB threshold)
+app.use(compressionMiddleware());
 
 app.use(express.json());
 
@@ -123,6 +139,22 @@ app.use(
   systemFailoverRouter,
 );
 
+// Issue #1082 – Governance Proposal Execution Status Webhook Broadcaster
+app.use(
+  "/api/v1/admin/governance/webhooks",
+  adminMiddleware,
+  adminRateLimitMiddleware,
+  governanceWebhooksRouter,
+);
+
+// Issue #1055 – Internal event bus metrics and queue backpressure alert bot
+app.use(
+  "/api/v1/admin/event-bus",
+  adminMiddleware,
+  adminRateLimitMiddleware,
+  eventBusRouter,
+);
+
 app.use("/api/v1/market-rates", marketRatesRouter);
 app.use("/api/v1/history", historyRouter);
 app.use("/api/v1/stats", statsRouter);
@@ -144,6 +176,8 @@ app.use("/api/v1/zk", zkRouter);
 app.use("/api/v1/governance", governanceRouter);
 app.use("/api/v1/proof", proofRouter);
 app.use("/api/v1/orders", ordersRouter);
+app.use("/api/v1/users/watchlist", watchlistRouter);
+app.use("/api/v1/treasury", treasuryRouter);
 
 // Issue #815 – Remittance transaction history endpoint
 app.use("/api/v1/remittance", remittanceRouter);
@@ -152,6 +186,10 @@ app.use("/api/v1/payment-routing", paymentRoutingRouter);
 
 // Issue #931 – Anchor SEP-24 / SEP-31 Webhook Ingestion Service
 app.use("/api/v1/anchors", anchorsRouter);
+app.use("/api/v1/sep31", sep31Router);
+
+// Issue #1015 – SEP-24 interactive session initiation (authenticated by the /api chain)
+app.use("/api/v1/sep24", sep24InitiationRouter);
 
 // Issue #836 – Soroban Contract Instruction & Storage Rent Estimator
 // eslint-disable-next-line no-undef
