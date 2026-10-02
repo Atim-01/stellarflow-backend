@@ -191,6 +191,9 @@ app.use("/api/v1/sep31", sep31Router);
 // Issue #1015 – SEP-24 interactive session initiation (authenticated by the /api chain)
 app.use("/api/v1/sep24", sep24InitiationRouter);
 
+// Issue #1046 – Yield Farming Token Emission Schedule Calculator
+app.use("/api/v1/yield", yieldEmissionRouter);
+
 // Issue #836 – Soroban Contract Instruction & Storage Rent Estimator
 // eslint-disable-next-line no-undef
 app.use("/api/v1/soroban/rent", sorobanRentEstimateRouter);
@@ -250,6 +253,11 @@ app.get("/", (req, res) => {
         requestQuote: "POST /api/v1/payment-routing/quotes",
         lockQuote: "POST /api/v1/payment-routing/quotes/:id/lock",
         getQuote: "GET /api/v1/payment-routing/quotes/:id",
+      },
+      yield: {
+        emissions: "/api/v1/yield/emissions",
+        emissionRate: "/api/v1/yield/emissions/rate",
+        emissionSchedule: "/api/v1/yield/emissions/schedule",
       },
     },
   });
