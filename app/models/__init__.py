@@ -659,4 +659,27 @@ __all__ = [
     "OhlcCandleItem",
     "OhlcResponse",
     "AggregatorStatusResponse",
+    # Shielded Note Indexer ORM models
+    "ShieldedCommitment",
+    "SpentNullifier",
+    "MerkleRoot",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Shielded Note Indexer ORM models
+# ---------------------------------------------------------------------------
+
+from app.models.shielded import MerkleRoot, ShieldedCommitment, SpentNullifier  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Capital Allocation and Rebalancing ORM models
+# ---------------------------------------------------------------------------
+
+from app.models.allocation import CapitalAllocation, RebalancingHistory, VaultStrategy  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Protocol Treasury Yield Auto-Staking ORM models
+# ---------------------------------------------------------------------------
+
+from app.models.treasury import TreasuryYieldAllocation, TreasuryYieldReport  # noqa: E402

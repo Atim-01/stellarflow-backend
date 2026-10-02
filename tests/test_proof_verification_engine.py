@@ -37,6 +37,7 @@ from app.services.proof_verification_engine import (
     verify_proof_async,
     verify_proof_batch,
 )
+from app.services.executor_pool import HEAVY_POOL_WORKERS
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +232,7 @@ class TestProcessPool:
     def test_pool_creates_with_workers(self):
         pool = get_process_pool()
         assert pool is not None
-        assert pool._max_workers == PROOF_PROCESS_POOL_WORKERS
+        assert pool._max_workers == HEAVY_POOL_WORKERS
 
     def test_shutdown_clean(self):
         pool = get_process_pool()

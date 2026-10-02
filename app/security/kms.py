@@ -48,6 +48,7 @@ __all__ = [
     "KeyRotationHandler",
     # Horizon broadcast helper
     "verify_signed_envelope",
+    "verify_envelope_async",
 ]
 
 # ---------------------------------------------------------------------------
@@ -627,6 +628,28 @@ def verify_signed_envelope(envelope: SignedEnvelope) -> bool:
     return hmac.compare_digest(sig_bytes, expected)
 
 
+async def verify_envelope_async(envelope: SignedEnvelope) -> bool:
+    """Verify the Ed25519 signature on *envelope* without blocking the event loop.
+
+    Offloads the CPU-intensive elliptic-curve verification to the heavy
+    :class:`~app.services.executor_pool.ProcessPoolExecutor` so that the
+    FastAPI event loop remains responsive.
+
+    Parameters
+    ----------
+    envelope:
+        The :class:`SignedEnvelope` to verify.
+
+    Returns
+    -------
+    bool
+        ``True`` if the signature is cryptographically valid, ``False`` otherwise.
+    """
+    from app.services.executor_pool import run_in_heavy_pool
+
+    return await run_in_heavy_pool(verify_signed_envelope, envelope)
+
+
 # ---------------------------------------------------------------------------
 # Key rotation orchestrator
 # ---------------------------------------------------------------------------
@@ -897,3 +920,80 @@ class KeyRotationHandler:
                 "Call KeyRotationHandler.start() before signing."
             )
         return handle
+
+    # ------------------------------------------------------------------
+    # Additional methods for audit logging
+    # ------------------------------------------------------------------
+
+    def get_active_key(self) -> Optional[KeyHandle]:
+        """Return the currently active key handle, or None if not initialized."""
+        return self._active_handle
+
+    def get_key_by_id(self, key_id: str) -> Optional[KeyHandle]:
+        """Retrieve a key handle by its ID. Searches active key and rotation history.
+
+        Parameters
+        ----------
+        key_id : str
+            The key ID to search for.
+
+        Returns
+        -------
+        Optional[KeyHandle]
+            The key handle if found, None otherwise.
+        """
+        # Check active key first
+        if self._active_handle and self._active_handle.key_id == key_id:
+            return self._active_handle
+        
+        # TODO: In a full implementation, we would maintain a cache of all retired keys
+        # For now, this is a placeholder that only finds the active key
+        logger.warning("Key lookup by ID %s is limited to active key only in current implementation", key_id)
+        return None
+
+    async def sign_bytes(self, message: bytes, handle: KeyHandle) -> bytes:
+        """Sign arbitrary bytes with the specified key handle.
+
+        Used by the audit logging system to sign record hashes.
+
+        Parameters
+        ----------
+        message : bytes
+            The raw bytes to sign.
+        handle : KeyHandle
+            The key handle to use for signing.
+
+        Returns
+        -------
+        bytes
+            The raw signature bytes.
+        """
+        return await self._provider.sign(handle, message)
+
+    async def verify_signature(self, message: bytes, signature: bytes, public_key_b64: str) -> bool:
+        """Verify a signature against a message and public key.
+
+        Used by the audit logging system to verify record authenticity.
+
+        Parameters
+        ----------
+        message : bytes
+            The original message bytes that were signed.
+        signature : bytes
+            The raw signature bytes to verify.
+        public_key_b64 : str
+            Base64-encoded public key to use for verification.
+
+        Returns
+        -------
+        bool
+            True if the signature is valid, False otherwise.
+        """
+        # Create a temporary envelope-like structure to reuse the existing verification logic
+        from unittest.mock import Mock
+        envelope = Mock()
+        envelope.signer_public_key_b64 = public_key_b64
+        envelope.signature_b64 = base64.b64encode(signature).decode()
+        envelope.message_hash = message
+        
+        return verify_signed_envelope(envelope)

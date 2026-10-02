@@ -18,9 +18,13 @@ export enum AlertType {
   FAILOVER_EVENT = "failover_event",
   HEALTH_CHECK_FAILURE = "health_check_failure",
   SECURITY_ALERT = "security_alert",
+  INVARIANT_BREACH = "invariant_breach",
   POOL_RESERVE_DEVIATION = "pool_reserve_deviation",
+  AMM_RESERVE_DIVERGENCE = "amm_reserve_divergence",
   REDIS_MEMORY_THRESHOLD = "redis_memory_threshold",
   VAULT_LIQUIDATION_RISK = "vault_liquidation_risk",
+  SUPPLY_INVARIANT_DRIFT = "supply_invariant_drift",
+  GOVERNANCE_TIMELOCK_READY = "governance_timelock_ready",
 }
 
 export interface SystemAlert {
@@ -38,7 +42,8 @@ export interface SystemAlert {
 export interface NotificationConfig {
   discordWebhookUrl?: string | undefined;
   slackWebhookUrl?: string | undefined;
-  enabledPlatforms: ("discord" | "slack")[];
+  pagerdutyIntegrationKey?: string | undefined;
+  enabledPlatforms: ("discord" | "slack" | "pagerduty")[];
   rateLimitMinutes: number;
   retryAttempts: number;
   timeoutMs: number;
@@ -114,7 +119,7 @@ interface SlackPayload {
 export class NotificationService {
   private config: NotificationConfig;
   private lastSentTimes: Map<string, number> = new Map();
-  // eslint-disable-next-line @typescript-eslint/naming-convention
+
   private readonly COLORS = {
     [AlertSeverity.LOW]: 0x00ff00, // Green
     [AlertSeverity.MEDIUM]: 0xffff00, // Yellow
@@ -122,7 +127,6 @@ export class NotificationService {
     [AlertSeverity.CRITICAL]: 0xff0000, // Red
   };
 
-  // eslint-disable-next-line @typescript-eslint/naming-convention
   private readonly SLACK_COLORS = {
     [AlertSeverity.LOW]: "good",
     [AlertSeverity.MEDIUM]: "warning",
@@ -486,6 +490,40 @@ export class NotificationService {
     });
   }
 
+  /**
+   * Send a high-priority security alert when an invariant violation triggers
+   * the automated circuit breaker. Fires on the immediate high-priority
+   * channel (Discord/Slack) so the security team is notified right away.
+   */
+  public async sendInvariantBreachAlert(details: {
+    breachType: string;
+    reason: string;
+    contractId?: string;
+    txHash?: string;
+    service?: string;
+    region?: string;
+    correlationId?: string;
+  }): Promise<boolean> {
+    return this.sendAlert({
+      type: AlertType.INVARIANT_BREACH,
+      severity: AlertSeverity.CRITICAL,
+      title: "🚨 INVARIANT VIOLATION — CIRCUIT BREAKER TRIGGERED",
+      message: `Automated circuit breaker triggered: ${details.reason}`,
+      details: {
+        breach_type: details.breachType,
+        reason: details.reason,
+        ...(details.contractId ? { contract_id: details.contractId } : {}),
+        ...(details.txHash ? { pause_tx_hash: details.txHash } : {}),
+        action_taken: "pause() submitted via emergency keeper key",
+        manual_intervention_required: true,
+      },
+      timestamp: new Date(),
+      service: details.service ?? "circuit-breaker",
+      region: details.region,
+      correlationId: details.correlationId,
+    });
+  }
+
   public async sendPriceAnomalyAlert(details: {
     currency: string;
     rate: number;
@@ -531,6 +569,33 @@ export class NotificationService {
       },
       timestamp: new Date(),
       service: "governance-timelock-service",
+      correlationId: details.correlationId,
+    });
+  }
+
+  public async sendSupplyInvariantDriftAlert(details: {
+    poolId: string;
+    physicalBalance: number;
+    internalBalance: number;
+    variancePercent: number;
+    blockHeight?: number;
+    correlationId?: string;
+  }): Promise<boolean> {
+    return this.sendAlert({
+      type: AlertType.SUPPLY_INVARIANT_DRIFT,
+      severity: AlertSeverity.CRITICAL,
+      title: "🚨 SUPPLY INVARIANT DRIFT DETECTED",
+      message: `Pool ${details.poolId} physical reserve (${details.physicalBalance}) drifts ${details.variancePercent.toFixed(4)}% from internal balance (${details.internalBalance}).`,
+      details: {
+        pool_id: details.poolId,
+        physical_balance: details.physicalBalance,
+        internal_balance: details.internalBalance,
+        variance_percent: details.variancePercent,
+        block_height: details.blockHeight ?? 0,
+        action_required: "Trigger high-priority PagerDuty alert and investigate smart contract pool accounting",
+      },
+      timestamp: new Date(),
+      service: "supply-invariant-worker",
       correlationId: details.correlationId,
     });
   }
@@ -590,3 +655,8 @@ export const sendFailoverEventAlert =
   notificationService.sendFailoverEventAlert.bind(notificationService);
 export const sendPriceAnomalyAlert =
   notificationService.sendPriceAnomalyAlert.bind(notificationService);
+export const sendInvariantBreachAlert =
+  notificationService.sendInvariantBreachAlert.bind(notificationService);
+export const sendSupplyInvariantDriftAlert =
+  notificationService.sendSupplyInvariantDriftAlert.bind(notificationService);
+

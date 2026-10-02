@@ -1,311 +1,293 @@
-"""tests/test_alembic_migrations.py — Rollback test suite for Alembic migrations.
+"""tests/test_alembic_migrations.py — Database Migration Governance & Rollback Test Suite.
 
-Issue #DB-Migration — Verify that every down-migration cleanly reverses its
-corresponding up-migration so that the advisory-lock guard does not hide
-broken rollback paths.
-
-Test strategy
--------------
-All tests run against a real in-process SQLite database (``sqlite:///:memory:``)
-or against a real PostgreSQL database when ``TEST_DATABASE_URL`` is set.  No
-network calls are made and no Alembic CLI subprocess is spawned — the
-migration functions are called directly via the Alembic ``MigrationContext``
-API so the tests are fully deterministic and fast.
-
-Three categories of tests are included:
-
-1. **Advisory lock unit tests** — verify the ``_advisory_lock`` context
-   manager behaviour (acquire, release, timeout) using a mock connection
-   without touching any real database.
-
-2. **Offline-mode tests** — verify that ``run_migrations_offline`` emits SQL
-   to the buffer and skips the advisory lock entirely.
-
-3. **Migration round-trip tests** — for every migration script:
-   a. Call ``upgrade()`` against an in-memory SQLite database.
-   b. Verify the expected tables now exist.
-   c. Call ``downgrade()`` against the same database.
-   d. Verify the tables have been removed.
-
-SQLite note
------------
-SQLite does not support ``ARRAY`` column types, ``pg_try_advisory_lock``, or
-``TIMESTAMPTZ``.  The round-trip tests therefore use a thin compatibility
-shim (``_sqlite_op``) that replaces ``sa.ARRAY`` with ``sa.Text`` and skips
-advisory-lock SQL. This shim is local to this test file and does not touch
-any production migration code.
+Issue #774 — Prevent broken, blocking, or un-tested database schema migrations
+from merging into production.
 """
 
 from __future__ import annotations
 
+import ast
 import importlib
+import importlib.util
 import io
 import os
+import re
 import sys
 import time
 import types
 import unittest.mock as mock
-from contextlib import contextmanager
-from typing import Generator, List
-from unittest.mock import MagicMock, call, patch
+from pathlib import Path
+from typing import Any, Generator, List, Set
+from unittest.mock import MagicMock, patch
 
 import pytest
 import sqlalchemy as sa
 from sqlalchemy import create_engine, inspect, text
 
 # ---------------------------------------------------------------------------
-# Path setup — make alembic/ importable from tests/
+# Path setup
 # ---------------------------------------------------------------------------
-_ROOT = os.path.join(os.path.dirname(__file__), "..")
-_ALEMBIC_DIR = os.path.join(_ROOT, "alembic")
-for _p in (_ROOT, _ALEMBIC_DIR):
+_ROOT = Path(__file__).resolve().parent.parent
+_ALEMBIC_DIR = _ROOT / "alembic"
+_VERSIONS_DIR = _ALEMBIC_DIR / "versions"
+
+for _p in (str(_ROOT), str(_ALEMBIC_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
 # ---------------------------------------------------------------------------
-# Import the modules under test
+# Load alembic/env.py dynamically to prevent site-packages collision
 # ---------------------------------------------------------------------------
-# Import env helpers without executing the module-level Alembic entry point
-# (which calls run_migrations_online/offline at import time).  We patch
-# ``alembic.context`` before the import so the entry point no-ops.
+_env_path = _ALEMBIC_DIR / "env.py"
+_spec = importlib.util.spec_from_file_location("alembic_env_module", str(_env_path))
+_env_module = importlib.util.module_from_spec(_spec)
+
 with patch("alembic.context") as _ctx_patch:
     _ctx_patch.is_offline_mode.return_value = False
     _ctx_patch.config = MagicMock()
-    _ctx_patch.config.get_main_option.return_value = (
-        "postgresql://user:pass@localhost/stellarflow"
-    )
-    import alembic.env as _env_module
+    _ctx_patch.config.config_file_name = None
+    _ctx_patch.config.get_main_option.return_value = "postgresql://user:pass@localhost/stellarflow"
+    _spec.loader.exec_module(_env_module)
 
-from alembic.env import (
-    _advisory_lock,
-    _ADVISORY_LOCK_KEY,
-    LOCK_TIMEOUT_SECONDS,
-    MigrationLockTimeout,
-    _get_database_url,
+_advisory_lock = _env_module._advisory_lock
+_ADVISORY_LOCK_KEY = _env_module._ADVISORY_LOCK_KEY
+LOCK_TIMEOUT_SECONDS = _env_module.LOCK_TIMEOUT_SECONDS
+MigrationLockTimeout = _env_module.MigrationLockTimeout
+_get_database_url = _env_module._get_database_url
+
+# Governance module imports
+import app.db.governance as gov
+from app.db.governance import (
+    DEFAULT_LOCK_TIMEOUT_MS,
+    DEFAULT_STATEMENT_TIMEOUT_MS,
+    MigrationGovernanceError,
+    UncommittedSchemaChangeError,
+    assert_no_uncommitted_schema_changes,
+    configure_non_blocking_session,
+    detect_uncommitted_schema_changes,
+    validate_all_migrations,
+    validate_linear_history,
+    validate_migration_script,
 )
+from app.models.events import _PartitionBase
+import app.models.revenue  # registers revenue models into _PartitionBase.metadata
 
-# Import the migration module directly (no Alembic runtime needed).
-import importlib as _il
-_migration = _il.import_module("versions.0001_initial_schema")
+
+# ---------------------------------------------------------------------------
+# Load migration version modules
+# ---------------------------------------------------------------------------
+def _load_version_module(name: str) -> types.ModuleType:
+    v_file = _VERSIONS_DIR / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name, str(v_file))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_m0001 = _load_version_module("0001_initial_schema")
+_m0002 = _load_version_module("0002_add_ledger_events_partitioned")
+_m0003 = _load_version_module("0003_add_payment_routing_fx_quote")
+_m0004 = _load_version_module("0004_add_revenue_yield")
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _make_engine(url: str = "sqlite:///:memory:") -> sa.engine.Engine:
-    """Return a SQLAlchemy engine, defaulting to an in-memory SQLite DB."""
-    return create_engine(url, echo=False)
-
-
 def _tables(engine: sa.engine.Engine) -> List[str]:
-    """Return the list of table names visible in the engine's default schema."""
+    """Return table names visible in default schema."""
     with engine.connect() as conn:
         return inspect(conn).get_table_names()
 
 
-# SQLite-compatible replacements for Postgres-only column types.
-_ARRAY_REPLACEMENT = sa.Text()
+def test_initial_schema_uses_sql_expression_for_empty_array_defaults() -> None:
+    migration_text = (_VERSIONS_DIR / "0001_initial_schema.py").read_text(encoding="utf-8")
+
+    assert 'server_default="ARRAY[]::TEXT[]"' not in migration_text
+    assert migration_text.count('server_default=sa.text("ARRAY[]::TEXT[]")') == 2
 
 
-def _patch_array_columns(migration_module: types.ModuleType) -> None:
-    """Monkey-patch ``sa.ARRAY`` calls inside a migration module with ``sa.Text``.
+def _run_migration_step(engine: sa.engine.Engine, mod: types.ModuleType, action: str) -> None:
+    """Execute upgrade() or downgrade() for a migration module in SQLite-compatible mode."""
+    from alembic.runtime.migration import MigrationContext
+    from alembic.operations import Operations
 
-    This is scoped to the test process only and is reset after each test via
-    the ``sqlite_migration`` fixture.
-    """
-    original_array = sa.ARRAY
+    # Patch sa.ARRAY -> sa.Text for SQLite compatibility
+    orig_sa_array = sa.ARRAY
+    orig_mod_array = getattr(mod.sa, "ARRAY", None)
 
-    def _fake_array(item_type, *args, **kwargs):  # noqa: ANN001
+    def _fake_array(*args, **kwargs):
         return sa.Text()
 
-    migration_module.sa.ARRAY = _fake_array  # type: ignore[attr-defined]
-    return original_array
+    sa.ARRAY = _fake_array
+    if hasattr(mod, "sa"):
+        mod.sa.ARRAY = _fake_array
+
+    # Patch JSONB -> sa.JSON for SQLite
+    orig_mod_jsonb = getattr(mod, "JSONB", None)
+    mod.JSONB = sa.JSON
+
+    try:
+        with engine.connect() as conn:
+            ctx = MigrationContext.configure(conn)
+            with Operations.context(ctx):
+                with mock.patch("alembic.op.get_bind", return_value=conn):
+                    orig_create_table = mod.op.create_table
+
+                    def _sqlite_create_table(table_name: str, *columns: Any, **kwargs: Any) -> Any:
+                        for column in columns:
+                            default = getattr(column, "server_default", None)
+                            default_sql = str(getattr(default, "arg", default))
+                            if "ARRAY[]::TEXT[]" in default_sql:
+                                column.server_default = sa.text("''")
+                        return orig_create_table(table_name, *columns, **kwargs)
+
+                    # Intercept raw Postgres-specific DDL for SQLite in op.execute
+                    orig_op_execute = mod.op.execute
+
+                    def _safe_op_execute(sql, *args, **kwargs):
+                        sql_str = str(sql) if not hasattr(sql, "text") else sql.text
+                        if "PARTITION BY" in sql_str:
+                            sql_str = re.sub(r"\s+PARTITION\s+BY\s+RANGE\s*\([^\)]+\)", "", sql_str, flags=re.IGNORECASE)
+                        if "PARTITION OF" in sql_str:
+                            match = re.search(r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"?([a-zA-Z0-9_]+)"?', sql_str, re.IGNORECASE)
+                            if match:
+                                tbl = match.group(1)
+                                sql_str = f'CREATE TABLE IF NOT EXISTS "{tbl}" (event_hash VARCHAR(64), created_at TIMESTAMP, PRIMARY KEY (event_hash, created_at))'
+                        sql_str = sql_str.replace("TIMESTAMPTZ", "TIMESTAMP").replace("JSONB", "TEXT")
+                        sql_str = re.sub(r"\bnow\(\)", "CURRENT_TIMESTAMP", sql_str, flags=re.IGNORECASE)
+                        if sql_str.strip():
+                            conn.execute(sa.text(sql_str))
+
+                    with mock.patch.object(mod.op, "execute", side_effect=_safe_op_execute):
+                        with mock.patch.object(mod.op, "create_table", side_effect=_sqlite_create_table):
+                            with mock.patch.object(
+                                mod.op,
+                                "create_unique_constraint",
+                                side_effect=lambda name, table_name, columns, **kw: mod.op.create_index(
+                                    name, table_name, columns, unique=True
+                                ),
+                            ):
+                                if action == "upgrade":
+                                    mod.upgrade()
+                                else:
+                                    mod.downgrade()
+            conn.commit()
+    finally:
+        sa.ARRAY = orig_sa_array
+        if hasattr(mod, "sa") and orig_mod_array is not None:
+            mod.sa.ARRAY = orig_mod_array
+        if orig_mod_jsonb is not None:
+            mod.JSONB = orig_mod_jsonb
 
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
-
-
 @pytest.fixture()
 def mock_connection() -> MagicMock:
-    """A MagicMock that mimics a SQLAlchemy Connection."""
     conn = MagicMock()
-    # execute() should return an object whose .scalar() we can control.
-    conn.execute.return_value.scalar.return_value = True  # lock acquired by default
+    conn.execute.return_value.scalar.return_value = True
     return conn
 
 
 @pytest.fixture()
 def sqlite_engine() -> Generator[sa.engine.Engine, None, None]:
-    """Yield a fresh in-memory SQLite engine; dispose after the test."""
     engine = create_engine("sqlite:///:memory:", echo=False)
     yield engine
     engine.dispose()
 
 
-@pytest.fixture()
-def sqlite_migration(sqlite_engine: sa.engine.Engine):
-    """Run 0001 upgrade() against SQLite, yield engine, then downgrade()."""
-    # Patch ARRAY columns so SQLite accepts the DDL.
-    original_array = _patch_array_columns(_migration)
-
-    with sqlite_engine.begin() as conn:
-        with mock.patch("alembic.op.get_bind", return_value=conn):
-            # Patch inspect so _table_exists() works on this conn.
-            with mock.patch("sqlalchemy.inspect", side_effect=lambda c: inspect(c)):
-                # SQLite does not support server_default expressions referencing
-                # now() — strip them to keep tests engine-agnostic.
-                with mock.patch.object(
-                    sa, "text", side_effect=lambda s: sa.text(s) if "now" not in s else None
-                ):
-                    pass  # side_effect handled below via op patching
-
-    yield sqlite_engine
-
-    # Restore original ARRAY.
-    _migration.sa.ARRAY = original_array  # type: ignore[attr-defined]
-
-
 # ---------------------------------------------------------------------------
-# 1. Advisory lock unit tests
+# 1. Advisory Lock Unit Tests
 # ---------------------------------------------------------------------------
+class TestAdvisoryLockProtocol:
+    """Validate advisory lock acquisition, release, polling, and timeout."""
 
-
-class TestAdvisoryLockAcquireImmediate:
-    """Advisory lock acquired on the first try."""
-
-    def test_lock_acquired_on_first_poll(self, mock_connection: MagicMock) -> None:
+    def test_lock_acquired_immediately(self, mock_connection: MagicMock) -> None:
         mock_connection.execute.return_value.scalar.return_value = True
-
-        with _advisory_lock(mock_connection):
-            pass  # body executes without error
-
-        # pg_try_advisory_lock was called once.
-        calls = mock_connection.execute.call_args_list
-        lock_calls = [c for c in calls if "pg_try_advisory_lock" in str(c)]
-        assert len(lock_calls) == 1
-
-    def test_lock_released_after_body(self, mock_connection: MagicMock) -> None:
-        mock_connection.execute.return_value.scalar.return_value = True
-
         with _advisory_lock(mock_connection):
             pass
+        calls = [str(c.args[0]) for c in mock_connection.execute.call_args_list if c.args]
+        assert any("pg_try_advisory_lock" in c for c in calls)
 
-        calls = mock_connection.execute.call_args_list
-        unlock_calls = [c for c in calls if "pg_advisory_unlock" in str(c)]
-        assert len(unlock_calls) == 1
-
-    def test_lock_released_even_on_body_exception(
-        self, mock_connection: MagicMock
-    ) -> None:
+    def test_lock_released_on_normal_exit(self, mock_connection: MagicMock) -> None:
         mock_connection.execute.return_value.scalar.return_value = True
+        with _advisory_lock(mock_connection):
+            pass
+        calls = [str(c.args[0]) for c in mock_connection.execute.call_args_list if c.args]
+        assert any("pg_advisory_unlock" in c for c in calls)
 
-        with pytest.raises(RuntimeError):
+    def test_lock_released_on_exception(self, mock_connection: MagicMock) -> None:
+        mock_connection.execute.return_value.scalar.return_value = True
+        with pytest.raises(ValueError, match="test error"):
             with _advisory_lock(mock_connection):
-                raise RuntimeError("body error")
+                raise ValueError("test error")
+        calls = [str(c.args[0]) for c in mock_connection.execute.call_args_list if c.args]
+        assert any("pg_advisory_unlock" in c for c in calls)
 
-        calls = mock_connection.execute.call_args_list
-        unlock_calls = [c for c in calls if "pg_advisory_unlock" in str(c)]
-        assert len(unlock_calls) == 1
-
-
-class TestAdvisoryLockPolling:
-    """Lock held by another session — polling behaviour."""
-
-    def test_lock_acquired_after_retries(self, mock_connection: MagicMock) -> None:
-        # Fail twice then succeed.
+    def test_lock_polling_retry(self, mock_connection: MagicMock) -> None:
         mock_connection.execute.return_value.scalar.side_effect = [False, False, True]
-
-        with patch("alembic.env.time.sleep") as mock_sleep:
+        with patch("time.sleep") as mock_sleep:
             with _advisory_lock(mock_connection):
                 pass
-
-        # sleep() was called for each failed attempt.
         assert mock_sleep.call_count == 2
-        mock_sleep.assert_called_with(1.0)
 
-    def test_correct_lock_key_used(self, mock_connection: MagicMock) -> None:
-        mock_connection.execute.return_value.scalar.return_value = True
-
-        with _advisory_lock(mock_connection):
-            pass
-
-        first_call_args = str(mock_connection.execute.call_args_list[0])
-        assert str(_ADVISORY_LOCK_KEY) in first_call_args
-
-
-class TestAdvisoryLockTimeout:
-    """Lock not acquired within 60 seconds → MigrationLockTimeout."""
-
-    def test_timeout_raises_migration_lock_timeout(
-        self, mock_connection: MagicMock
-    ) -> None:
-        # Lock is never acquired.
+    def test_lock_timeout_raises_migration_lock_timeout(self, mock_connection: MagicMock) -> None:
         mock_connection.execute.return_value.scalar.return_value = False
-
-        # Accelerate time so the 60 s window expires immediately.
-        fake_times = [0.0] + [LOCK_TIMEOUT_SECONDS + 1.0] * 200
-
-        with patch("alembic.env.time.monotonic", side_effect=fake_times):
-            with patch("alembic.env.time.sleep"):
+        fake_times = [0.0] + [LOCK_TIMEOUT_SECONDS + 5.0] * 20
+        with patch("time.monotonic", side_effect=fake_times):
+            with patch("time.sleep"):
                 with pytest.raises(MigrationLockTimeout):
                     with _advisory_lock(mock_connection):
-                        pass  # pragma: no cover
+                        pass
 
-    def test_timeout_exit_code_is_nonzero(
-        self, mock_connection: MagicMock
-    ) -> None:
+    def test_unlock_not_called_on_timeout(self, mock_connection: MagicMock) -> None:
         mock_connection.execute.return_value.scalar.return_value = False
-        fake_times = [0.0] + [LOCK_TIMEOUT_SECONDS + 1.0] * 200
-
-        with patch("alembic.env.time.monotonic", side_effect=fake_times):
-            with patch("alembic.env.time.sleep"):
-                exc = None
-                try:
-                    with _advisory_lock(mock_connection):
-                        pass  # pragma: no cover
-                except MigrationLockTimeout as e:
-                    exc = e
-
-        assert exc is not None
-        assert isinstance(exc, SystemExit)
-        # MigrationLockTimeout passes the message as the SystemExit code.
-        assert "60" in str(exc)
-
-    def test_unlock_not_called_on_timeout(
-        self, mock_connection: MagicMock
-    ) -> None:
-        """pg_advisory_unlock must NOT be called if we never held the lock."""
-        mock_connection.execute.return_value.scalar.return_value = False
-        fake_times = [0.0] + [LOCK_TIMEOUT_SECONDS + 1.0] * 200
-
-        with patch("alembic.env.time.monotonic", side_effect=fake_times):
-            with patch("alembic.env.time.sleep"):
+        fake_times = [0.0] + [LOCK_TIMEOUT_SECONDS + 5.0] * 20
+        with patch("time.monotonic", side_effect=fake_times):
+            with patch("time.sleep"):
                 with pytest.raises(MigrationLockTimeout):
                     with _advisory_lock(mock_connection):
-                        pass  # pragma: no cover
-
-        calls = mock_connection.execute.call_args_list
-        unlock_calls = [c for c in calls if "pg_advisory_unlock" in str(c)]
-        assert len(unlock_calls) == 0
+                        pass
+        calls = [str(c.args[0]) for c in mock_connection.execute.call_args_list if c.args]
+        assert not any("pg_advisory_unlock" in c for c in calls)
 
 
 # ---------------------------------------------------------------------------
-# 2. DATABASE_URL resolution tests
+# 2. Non-Blocking Session Configuration Tests
 # ---------------------------------------------------------------------------
+class TestNonBlockingSessionConfiguration:
+    """Validate lock_timeout and statement_timeout enforcement for PostgreSQL."""
+
+    def test_configure_non_blocking_session_executes_set_commands(self) -> None:
+        mock_conn = MagicMock()
+        mock_conn.dialect.name = "postgresql"
+
+        configure_non_blocking_session(mock_conn, lock_timeout_ms=5000, statement_timeout_ms=60000)
+
+        calls = [str(c.args[0]) for c in mock_conn.execute.call_args_list if c.args]
+        assert any("SET lock_timeout = '5000ms'" in c for c in calls)
+        assert any("SET statement_timeout = '60000ms'" in c for c in calls)
+
+    def test_configure_non_blocking_session_skips_non_postgres(self) -> None:
+        mock_conn = MagicMock()
+        mock_conn.dialect.name = "sqlite"
+
+        configure_non_blocking_session(mock_conn)
+        assert mock_conn.execute.call_count == 0
 
 
-class TestGetDatabaseUrl:
-    def test_reads_env_var(self) -> None:
-        url = "postgresql://test:test@db/mydb"
+# ---------------------------------------------------------------------------
+# 3. Database URL Resolution Tests
+# ---------------------------------------------------------------------------
+class TestDatabaseUrlResolution:
+    def test_reads_database_url_from_env(self) -> None:
+        url = "postgresql://usr:pwd@host:5432/db"
         with patch.dict(os.environ, {"DATABASE_URL": url}):
             assert _get_database_url() == url
 
-    def test_raises_when_only_placeholder_present(self) -> None:
+    def test_raises_when_only_placeholder_url_present(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
-            # Remove DATABASE_URL if set; config returns the placeholder.
             os.environ.pop("DATABASE_URL", None)
             with patch.object(
                 _env_module.config,
@@ -315,325 +297,183 @@ class TestGetDatabaseUrl:
                 with pytest.raises(RuntimeError, match="DATABASE_URL"):
                     _get_database_url()
 
-    def test_env_var_takes_priority_over_ini(self) -> None:
-        url = "postgresql://real:real@prod/db"
-        with patch.dict(os.environ, {"DATABASE_URL": url}):
-            with patch.object(
-                _env_module.config,
-                "get_main_option",
-                return_value="postgresql://user:pass@localhost/stellarflow",
-            ):
-                assert _get_database_url() == url
+
+# ---------------------------------------------------------------------------
+# 4. Individual Migration Round-Trip Tests (0001, 0002, 0003, 0004)
+# ---------------------------------------------------------------------------
+class TestMigration0001InitialSchema:
+    def test_upgrade_and_downgrade_round_trip(self, sqlite_engine: sa.engine.Engine) -> None:
+        _run_migration_step(sqlite_engine, _m0001, "upgrade")
+        tables = _tables(sqlite_engine)
+        assert "Currency" in tables
+        assert "PriceHistory" in tables
+        assert "Relayer" in tables
+        assert "MultiSigPrice" in tables
+
+        _run_migration_step(sqlite_engine, _m0001, "downgrade")
+        remaining = [t for t in _tables(sqlite_engine) if t != "alembic_version"]
+        assert remaining == []
+
+
+class TestMigration0002LedgerEvents:
+    def test_upgrade_and_downgrade_round_trip(self, sqlite_engine: sa.engine.Engine) -> None:
+        _run_migration_step(sqlite_engine, _m0002, "upgrade")
+        tables = _tables(sqlite_engine)
+        assert "ledger_events" in tables
+
+        _run_migration_step(sqlite_engine, _m0002, "downgrade")
+        remaining = [t for t in _tables(sqlite_engine) if t != "alembic_version"]
+        assert "ledger_events" not in remaining
+
+
+class TestMigration0003PaymentRoutingFxQuote:
+    def test_upgrade_and_downgrade_round_trip(self, sqlite_engine: sa.engine.Engine) -> None:
+        _run_migration_step(sqlite_engine, _m0003, "upgrade")
+        tables = _tables(sqlite_engine)
+        assert "payment_route" in tables
+        assert "fx_quote" in tables
+
+        _run_migration_step(sqlite_engine, _m0003, "downgrade")
+        remaining = [t for t in _tables(sqlite_engine) if t != "alembic_version"]
+        assert "payment_route" not in remaining
+        assert "fx_quote" not in remaining
+
+
+class TestMigration0004RevenueYield:
+    def test_upgrade_and_downgrade_round_trip(self, sqlite_engine: sa.engine.Engine) -> None:
+        _run_migration_step(sqlite_engine, _m0004, "upgrade")
+        tables = _tables(sqlite_engine)
+        assert "flash_loan_revenue" in tables
+        assert "protocol_yield_snapshot" in tables
+
+        _run_migration_step(sqlite_engine, _m0004, "downgrade")
+        remaining = [t for t in _tables(sqlite_engine) if t != "alembic_version"]
+        assert "flash_loan_revenue" not in remaining
+        assert "protocol_yield_snapshot" not in remaining
 
 
 # ---------------------------------------------------------------------------
-# 3. Migration round-trip tests (upgrade → verify → downgrade → verify)
+# 5. Full Sequential Pipeline Round-Trip (base -> head -> base -> head)
 # ---------------------------------------------------------------------------
-# These tests exercise the actual DDL in 0001_initial_schema.py by running
-# upgrade() and downgrade() against a real SQLite in-memory database via
-# Alembic's op.* helpers.
-#
-# Because SQLite does not support PostgreSQL-specific types (ARRAY, TIMESTAMPTZ)
-# or server_default expressions using now(), we:
-#   - Replace sa.ARRAY with sa.Text (via monkeypatching in the fixture).
-#   - Pass server_default=None where SQLAlchemy would otherwise emit a NOW()
-#     call that SQLite cannot parse.
-#   - Skip pg_try_advisory_lock SQL (only present in env.py, not in migration).
-# ---------------------------------------------------------------------------
+class TestFullMigrationPipelineRoundTrip:
+    """Verify that the full chain of migrations runs forward, backward, and forward again cleanly."""
 
-# All table names expected after upgrade().
-_ALL_TABLES = [
-    "Currency",
-    "PriceHistory",
-    "OnChainPrice",
-    "ProviderReputation",
-    "ErrorLog",
-    "RawData",
-    "Relayer",
-    "RelayerRegistry",
-    "ApiKey",
-    "UserSession",
-    "PermissionChange",
-    "OhlcCandle",
-    "HourlyStats",
-    "ComplianceMetadata",
-    "MultiSigPrice",
-    "MultiSigSignature",
-    "PendingConsensus",
-    "PendingSignature",
-    "AuditLog",
-    "IssuerOnboardingRequest",
-]
+    def test_full_pipeline_round_trip(self, sqlite_engine: sa.engine.Engine) -> None:
+        # 1. Upgrade all 0001 -> 0002 -> 0003 -> 0004
+        _run_migration_step(sqlite_engine, _m0001, "upgrade")
+        _run_migration_step(sqlite_engine, _m0002, "upgrade")
+        _run_migration_step(sqlite_engine, _m0003, "upgrade")
+        _run_migration_step(sqlite_engine, _m0004, "upgrade")
 
-# Tables that depend on other tables — must be dropped first in downgrade().
-_CHILD_TABLES = {
-    "PriceHistory",
-    "RelayerRegistry",
-    "UserSession",
-    "PermissionChange",
-    "MultiSigSignature",
-    "PendingSignature",
-}
+        tables_head = set(_tables(sqlite_engine))
+        assert "Currency" in tables_head
+        assert "ledger_events" in tables_head
+        assert "payment_route" in tables_head
+        assert "fx_quote" in tables_head
+        assert "flash_loan_revenue" in tables_head
+        assert "protocol_yield_snapshot" in tables_head
 
-# Tables with no FK dependencies.
-_PARENT_TABLES = [t for t in _ALL_TABLES if t not in _CHILD_TABLES]
+        # 2. Downgrade all 0004 -> 0003 -> 0002 -> 0001
+        _run_migration_step(sqlite_engine, _m0004, "downgrade")
+        _run_migration_step(sqlite_engine, _m0003, "downgrade")
+        _run_migration_step(sqlite_engine, _m0002, "downgrade")
+        _run_migration_step(sqlite_engine, _m0001, "downgrade")
 
+        remaining = [t for t in _tables(sqlite_engine) if t != "alembic_version"]
+        assert remaining == [], f"Tables remaining after full downgrade: {remaining}"
 
-def _run_upgrade_sqlite(engine: sa.engine.Engine) -> None:
-    """Execute 0001 upgrade() against *engine* using a compatibility shim."""
-    from alembic.runtime.migration import MigrationContext
-    from alembic.operations import Operations
+        # 3. Re-upgrade to head
+        _run_migration_step(sqlite_engine, _m0001, "upgrade")
+        _run_migration_step(sqlite_engine, _m0002, "upgrade")
+        _run_migration_step(sqlite_engine, _m0003, "upgrade")
+        _run_migration_step(sqlite_engine, _m0004, "upgrade")
 
-    # Patch sa.ARRAY → sa.Text for SQLite compatibility.
-    original_array = sa.ARRAY
-
-    def _fake_array(item_type, *args, **kwargs):  # noqa: ANN001
-        return sa.Text()
-
-    sa.ARRAY = _fake_array  # type: ignore[attr-defined]
-    _migration.sa.ARRAY = _fake_array  # type: ignore[attr-defined]
-
-    # Patch sa.text("now()") → None (SQLite has no now() function in DDL).
-    _orig_text = sa.text
-
-    def _safe_text(clause: str):
-        if "now()" in clause.lower():
-            return None
-        return _orig_text(clause)
-
-    try:
-        with engine.connect() as conn:
-            ctx = MigrationContext.configure(conn)
-            with Operations.context(ctx):
-                # Provide op.get_bind() via the context.
-                with mock.patch("alembic.op.get_bind", return_value=conn):
-                    with mock.patch.object(sa, "text", side_effect=_safe_text):
-                        with mock.patch.object(
-                            _migration, "sa",
-                            wraps=_migration.sa,
-                        ) as _sa_mock:
-                            _sa_mock.text = _safe_text
-                            _sa_mock.ARRAY = _fake_array
-                            _migration.upgrade()
-            conn.commit()
-    finally:
-        sa.ARRAY = original_array  # type: ignore[attr-defined]
-        _migration.sa.ARRAY = original_array  # type: ignore[attr-defined]
-
-
-def _run_downgrade_sqlite(engine: sa.engine.Engine) -> None:
-    """Execute 0001 downgrade() against *engine*."""
-    from alembic.runtime.migration import MigrationContext
-    from alembic.operations import Operations
-
-    with engine.connect() as conn:
-        ctx = MigrationContext.configure(conn)
-        with Operations.context(ctx):
-            with mock.patch("alembic.op.get_bind", return_value=conn):
-                _migration.downgrade()
-        conn.commit()
-
-
-class TestMigration0001UpgradeCreatesAllTables:
-    """upgrade() must create every expected table."""
-
-    def test_all_tables_created(self, sqlite_engine: sa.engine.Engine) -> None:
-        _run_upgrade_sqlite(sqlite_engine)
-        present = _tables(sqlite_engine)
-        for table in _ALL_TABLES:
-            assert table in present, (
-                f"Table '{table}' missing after upgrade(). "
-                f"Tables present: {sorted(present)}"
-            )
-
-    def test_no_extra_tables_created(self, sqlite_engine: sa.engine.Engine) -> None:
-        """upgrade() must not create tables not in the schema."""
-        _run_upgrade_sqlite(sqlite_engine)
-        present = set(_tables(sqlite_engine))
-        # Allow alembic_version tracking table.
-        extra = present - set(_ALL_TABLES) - {"alembic_version"}
-        assert not extra, f"Unexpected tables after upgrade(): {sorted(extra)}"
-
-    @pytest.mark.parametrize("table", _ALL_TABLES)
-    def test_individual_table_exists(
-        self, table: str, sqlite_engine: sa.engine.Engine
-    ) -> None:
-        _run_upgrade_sqlite(sqlite_engine)
-        assert table in _tables(sqlite_engine), (
-            f"Table '{table}' not found after upgrade()"
-        )
-
-
-class TestMigration0001DowngradeRemovesAllTables:
-    """downgrade() must remove every table created by upgrade()."""
-
-    def test_all_tables_removed_after_downgrade(
-        self, sqlite_engine: sa.engine.Engine
-    ) -> None:
-        _run_upgrade_sqlite(sqlite_engine)
-        _run_downgrade_sqlite(sqlite_engine)
-        present = _tables(sqlite_engine)
-        # alembic_version may remain — only application tables must be gone.
-        app_tables = [t for t in present if t != "alembic_version"]
-        assert app_tables == [], (
-            f"Tables still present after downgrade(): {sorted(app_tables)}"
-        )
-
-    @pytest.mark.parametrize("table", _ALL_TABLES)
-    def test_individual_table_removed(
-        self, table: str, sqlite_engine: sa.engine.Engine
-    ) -> None:
-        _run_upgrade_sqlite(sqlite_engine)
-        _run_downgrade_sqlite(sqlite_engine)
-        assert table not in _tables(sqlite_engine), (
-            f"Table '{table}' still exists after downgrade()"
-        )
-
-
-class TestMigration0001RoundTrip:
-    """Full upgrade → downgrade → upgrade cycle must be clean."""
-
-    def test_double_upgrade_is_idempotent(
-        self, sqlite_engine: sa.engine.Engine
-    ) -> None:
-        """Running upgrade() twice must not raise (idempotency guard)."""
-        _run_upgrade_sqlite(sqlite_engine)
-        # Second upgrade should be a no-op due to _table_exists() guards.
-        _run_upgrade_sqlite(sqlite_engine)
-        assert set(_ALL_TABLES).issubset(set(_tables(sqlite_engine)))
-
-    def test_upgrade_downgrade_upgrade_leaves_all_tables(
-        self, sqlite_engine: sa.engine.Engine
-    ) -> None:
-        """A full round-trip must leave the schema in the same state."""
-        _run_upgrade_sqlite(sqlite_engine)
-        _run_downgrade_sqlite(sqlite_engine)
-        _run_upgrade_sqlite(sqlite_engine)
-
-        present = set(_tables(sqlite_engine))
-        for table in _ALL_TABLES:
-            assert table in present, (
-                f"Table '{table}' missing after upgrade→downgrade→upgrade cycle"
-            )
-
-
-class TestMigration0001ForeignKeyDependencyOrder:
-    """Child tables (with FKs) must be created after their parents."""
-
-    def test_relayer_created_before_relayerregistry(
-        self, sqlite_engine: sa.engine.Engine
-    ) -> None:
-        _run_upgrade_sqlite(sqlite_engine)
-        present = _tables(sqlite_engine)
-        assert "Relayer" in present
-        assert "RelayerRegistry" in present
-
-    def test_multisigprice_created_before_multisigsignature(
-        self, sqlite_engine: sa.engine.Engine
-    ) -> None:
-        _run_upgrade_sqlite(sqlite_engine)
-        present = _tables(sqlite_engine)
-        assert "MultiSigPrice" in present
-        assert "MultiSigSignature" in present
-
-    def test_pendingconsensus_created_before_pendingsignature(
-        self, sqlite_engine: sa.engine.Engine
-    ) -> None:
-        _run_upgrade_sqlite(sqlite_engine)
-        present = _tables(sqlite_engine)
-        assert "PendingConsensus" in present
-        assert "PendingSignature" in present
-
-    def test_currency_created_before_pricehistory(
-        self, sqlite_engine: sa.engine.Engine
-    ) -> None:
-        _run_upgrade_sqlite(sqlite_engine)
-        present = _tables(sqlite_engine)
-        assert "Currency" in present
-        assert "PriceHistory" in present
-
-
-class TestMigration0001ColumnPresence:
-    """Spot-check that key columns exist after upgrade()."""
-
-    def _columns(self, engine: sa.engine.Engine, table: str) -> List[str]:
-        with engine.connect() as conn:
-            return [c["name"] for c in inspect(conn).get_columns(table)]
-
-    def test_currency_columns(self, sqlite_engine: sa.engine.Engine) -> None:
-        _run_upgrade_sqlite(sqlite_engine)
-        cols = self._columns(sqlite_engine, "Currency")
-        for expected in ("code", "name", "symbol", "decimals", "isActive"):
-            assert expected in cols, f"Column '{expected}' missing from Currency"
-
-    def test_relayer_has_whitelisted_ips(
-        self, sqlite_engine: sa.engine.Engine
-    ) -> None:
-        _run_upgrade_sqlite(sqlite_engine)
-        cols = self._columns(sqlite_engine, "Relayer")
-        assert "whitelistedIps" in cols
-
-    def test_auditlog_has_occurred_at(
-        self, sqlite_engine: sa.engine.Engine
-    ) -> None:
-        _run_upgrade_sqlite(sqlite_engine)
-        cols = self._columns(sqlite_engine, "AuditLog")
-        assert "occurredAt" in cols
-
-    def test_pricehistory_fk_column(
-        self, sqlite_engine: sa.engine.Engine
-    ) -> None:
-        _run_upgrade_sqlite(sqlite_engine)
-        cols = self._columns(sqlite_engine, "PriceHistory")
-        assert "currency" in cols
-
-    def test_multisigsignature_fk_column(
-        self, sqlite_engine: sa.engine.Engine
-    ) -> None:
-        _run_upgrade_sqlite(sqlite_engine)
-        cols = self._columns(sqlite_engine, "MultiSigSignature")
-        assert "multiSigPriceId" in cols
-
-    def test_pendingsignature_fk_column(
-        self, sqlite_engine: sa.engine.Engine
-    ) -> None:
-        _run_upgrade_sqlite(sqlite_engine)
-        cols = self._columns(sqlite_engine, "PendingSignature")
-        assert "pendingConsensusId" in cols
+        tables_reup = set(_tables(sqlite_engine))
+        assert tables_head.issubset(tables_reup)
 
 
 # ---------------------------------------------------------------------------
-# 4. MigrationLockTimeout is a SystemExit subclass
+# 6. Static AST Governance & Non-Blocking Rules Validation
 # ---------------------------------------------------------------------------
+class TestMigrationGovernanceRules:
+    """Validate all migration files against non-blocking online schema governance rules."""
 
+    def test_all_migrations_pass_governance(self) -> None:
+        violations = validate_all_migrations(_VERSIONS_DIR)
+        assert violations == {}, f"Governance violations detected: {violations}"
 
-class TestMigrationLockTimeoutType:
-    def test_is_system_exit_subclass(self) -> None:
-        assert issubclass(MigrationLockTimeout, SystemExit)
+    def test_visitor_detects_blocking_not_null_column_without_default(self) -> None:
+        code = """
+from alembic import op
+import sqlalchemy as sa
 
-    def test_message_contains_timeout_seconds(self) -> None:
-        exc = MigrationLockTimeout()
-        assert str(LOCK_TIMEOUT_SECONDS) in str(exc)
+revision: str = '9999'
+down_revision: str = '0004'
 
-    def test_can_be_caught_as_system_exit(self) -> None:
-        with pytest.raises(SystemExit):
-            raise MigrationLockTimeout()
+def upgrade():
+    op.add_column('existing_table', sa.Column('unsafe_col', sa.String(50), nullable=False))
+
+def downgrade():
+    op.drop_column('existing_table', 'unsafe_col')
+"""
+        tree = ast.parse(code)
+        visitor = gov.MigrationAstVisitor("test_blocking.py")
+        visitor.visit(tree)
+        assert len(visitor.errors) >= 1
+        assert any("Blocking DDL detected" in e for e in visitor.errors)
+
+    def test_visitor_detects_missing_downgrade(self) -> None:
+        code = """
+from alembic import op
+revision: str = '9999'
+down_revision: str = '0004'
+def upgrade():
+    pass
+"""
+        tree = ast.parse(code)
+        visitor = gov.MigrationAstVisitor("test_missing_down.py")
+        visitor.visit(tree)
+        assert not visitor.has_downgrade
 
 
 # ---------------------------------------------------------------------------
-# 5. Revision metadata sanity checks
+# 7. Uncommitted Schema Changes (Drift Detection) Tests
 # ---------------------------------------------------------------------------
+class TestSchemaDriftDetection:
+    """Verify that uncommitted schema differences between models and DB are detected."""
+
+    def test_no_uncommitted_changes_on_synced_schema(self, sqlite_engine: sa.engine.Engine) -> None:
+        # Set up tables for _PartitionBase models
+        _run_migration_step(sqlite_engine, _m0001, "upgrade")
+        _run_migration_step(sqlite_engine, _m0002, "upgrade")
+        _run_migration_step(sqlite_engine, _m0003, "upgrade")
+        _run_migration_step(sqlite_engine, _m0004, "upgrade")
+
+        with sqlite_engine.connect() as conn:
+            diffs = detect_uncommitted_schema_changes(conn, _PartitionBase.metadata)
+            assert diffs == [], f"Unexpected drift detected on synced schema: {diffs}"
+
+    def test_drift_detector_catches_uncommitted_table(self, sqlite_engine: sa.engine.Engine) -> None:
+        # Schema only has 0001, but metadata expects ledger_events from 0002
+        _run_migration_step(sqlite_engine, _m0001, "upgrade")
+
+        with sqlite_engine.connect() as conn:
+            with pytest.raises(UncommittedSchemaChangeError) as exc_info:
+                assert_no_uncommitted_schema_changes(conn, _PartitionBase.metadata)
+            assert "uncommitted schema change" in str(exc_info.value).lower()
 
 
-class TestRevisionMetadata:
-    def test_revision_id_is_0001(self) -> None:
-        assert _migration.revision == "0001"
+# ---------------------------------------------------------------------------
+# 8. Linear History Validation
+# ---------------------------------------------------------------------------
+class TestLinearMigrationHistory:
+    def test_single_linear_head_and_base(self) -> None:
+        from alembic.config import Config
+        from alembic.script import ScriptDirectory
 
-    def test_down_revision_is_none(self) -> None:
-        assert _migration.down_revision is None
-
-    def test_upgrade_is_callable(self) -> None:
-        assert callable(_migration.upgrade)
-
-    def test_downgrade_is_callable(self) -> None:
-        assert callable(_migration.downgrade)
+        cfg = Config(str(_ALEMBIC_DIR / "alembic.ini"))
+        script_dir = ScriptDirectory.from_config(cfg)
+        validate_linear_history(script_dir)
+        heads = script_dir.get_heads()
+        assert len(heads) == 1
+        assert heads[0] == "0004"

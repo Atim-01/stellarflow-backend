@@ -4,9 +4,9 @@ import type { Config } from "jest";
  * Jest configuration for the TypeScript end-to-end integration suite.
  *
  * Mirrors the repo's default `jest.config.ts` (ESM + ts-jest) but scopes the
- * run to `tests/e2e/**/*.e2e.test.ts` and uses transpile-only (`isolatedModules`)
- * so importing production source modules never fails the suite on ambient
- * type errors. Run with: `npm run test:e2e`.
+ * run to the `.e2e.test.ts` files under `tests/e2e` and uses transpile-only
+ * (`isolatedModules`) so importing production source modules never fails the
+ * suite on ambient type errors. Run with: `npm run test:e2e`.
  */
 const config: Config = {
   testEnvironment: "node",

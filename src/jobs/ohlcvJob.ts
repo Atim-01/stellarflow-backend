@@ -1,7 +1,10 @@
 // src/jobs/ohlcvJob.ts
 import cron from "node-cron";
 import prisma from "../lib/prisma";
-import { subMinutes, subHours, subDays, startOfHour, startOfDay } from "date-fns";
+
+const MINUTE_MS = 60_000;
+const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 24 * HOUR_MS;
 
 interface AggregationWindow {
   start: Date;
@@ -15,13 +18,13 @@ export class OhlcvAggregator {
     const now = new Date();
     switch (timeframe) {
       case "1m":
-        return { start: subMinutes(now, 1), end: now };
+        return { start: new Date(now.getTime() - MINUTE_MS), end: now };
       case "15m":
-        return { start: subMinutes(now, 15), end: now };
+        return { start: new Date(now.getTime() - 15 * MINUTE_MS), end: now };
       case "1h":
-        return { start: subHours(now, 1), end: now };
+        return { start: new Date(now.getTime() - HOUR_MS), end: now };
       case "1d":
-        return { start: subDays(now, 1), end: now };
+        return { start: new Date(now.getTime() - DAY_MS), end: now };
       default:
         throw new Error(`Unsupported timeframe ${timeframe}`);
     }
@@ -41,10 +44,11 @@ export class OhlcvAggregator {
         select: { rate: true, timestamp: true },
       });
       if (rows.length === 0) continue;
-      const open = rows[0].rate;
-      const close = rows[rows.length - 1].rate;
-      const high = rows.reduce((max, r) => (r.rate > max ? r.rate : max), rows[0].rate);
-      const low = rows.reduce((min, r) => (r.rate < min ? r.rate : min), rows[0].rate);
+      const firstRate = rows[0]!.rate;
+      const open = firstRate;
+      const close = rows[rows.length - 1]!.rate;
+      const high = rows.reduce((max, r) => (r.rate > max ? r.rate : max), firstRate);
+      const low = rows.reduce((min, r) => (r.rate < min ? r.rate : min), firstRate);
       const volume = rows.length; // Simple count as volume placeholder
 
       const timestamp = start;
@@ -90,7 +94,7 @@ export class OhlcvAggregator {
    * Purge raw transaction logs older than 90 days.
    */
   async purgeOldLogs(): Promise<void> {
-    const cutoff = subDays(new Date(), 90);
+    const cutoff = new Date(Date.now() - 90 * DAY_MS);
     const deleted = await prisma.priceHistory.deleteMany({ where: { timestamp: { lt: cutoff } } });
     console.info(`[OhlcvAggregator] Purged ${deleted.count} PriceHistory rows older than ${cutoff.toISOString()}`);
   }

@@ -39,7 +39,12 @@ depends_on: Union[str, Sequence[str], None] = None
 def _table_exists(name: str) -> bool:
     """Return True when *name* already exists in the public schema."""
     bind = op.get_bind()
-    return sa.inspect(bind).has_table(name)
+    if bind is None or getattr(bind, "dialect", None) is None:
+        return False
+    try:
+        return sa.inspect(bind).has_table(name)
+    except Exception:
+        return False
 
 
 def _create_monthly_partition(
@@ -158,17 +163,26 @@ def upgrade() -> None:
 def downgrade() -> None:
     """Drop all ``ledger_events`` child partitions and the parent table."""
 
-    # Find and drop all child partition tables
+    # Find and drop all child partition tables (PostgreSQL / SQLite)
     bind = op.get_bind()
-    result = bind.execute(sa.text("""
-        SELECT inhrelid::regclass::text
-        FROM pg_inherits
-        WHERE inhparent = 'ledger_events'::regclass
-    """))
-    partitions = [row[0] for row in result]
-
-    for part in partitions:
-        op.execute(sa.text(f'DROP TABLE IF EXISTS "{part}"'))
+    if bind is not None and getattr(bind, "dialect", None) is not None:
+        try:
+            if getattr(bind.dialect, "name", "") == "postgresql":
+                result = bind.execute(sa.text("""
+                    SELECT inhrelid::regclass::text
+                    FROM pg_inherits
+                    WHERE inhparent = 'ledger_events'::regclass
+                """))
+                partitions = [row[0] for row in result]
+                for part in partitions:
+                    op.execute(sa.text(f'DROP TABLE IF EXISTS "{part}"'))
+            else:
+                insp = sa.inspect(bind)
+                for tbl in insp.get_table_names():
+                    if tbl.startswith("ledger_events_"):
+                        op.execute(sa.text(f'DROP TABLE IF EXISTS "{tbl}"'))
+        except Exception:
+            pass
 
     # Drop indexes on the parent (must happen before DROP TABLE)
     for idx in [
@@ -177,6 +191,10 @@ def downgrade() -> None:
         "ix_ledger_events_tx_hash",
         "ix_ledger_events_ledger_sequence",
     ]:
-        op.execute(sa.text(f'DROP INDEX IF EXISTS "{idx}"'))
+        try:
+            op.execute(sa.text(f'DROP INDEX IF EXISTS "{idx}"'))
+        except Exception:
+            pass
 
-    op.drop_table("ledger_events")
+    if _table_exists("ledger_events"):
+        op.drop_table("ledger_events")

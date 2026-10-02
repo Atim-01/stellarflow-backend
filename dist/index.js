@@ -1,13 +1,12 @@
 import { createServer } from "http";
-import cors from "cors";
 import dotenv from "dotenv";
-import express from "express";
-import { Horizon } from "@stellar/stellar-sdk";
-import { getStellarNetwork } from "./lib/stellarNetwork";
+import stellarProvider from "./lib/stellarProvider";
 import marketRatesRouter from "./routes/marketRates";
 import historyRouter from "./routes/history";
 import priceUpdatesRouter from "./routes/priceUpdates";
 import statsRouter from "./routes/stats";
+import bridgeRouter from "./routes/bridge";
+import vaultRoutes from "./routes/vaults";
 import app from "./app";
 import prisma from "./lib/prisma";
 import { disconnectRedis } from "./lib/redis";
@@ -18,9 +17,11 @@ import { multiSigSubmissionService } from "./services/multiSigSubmissionService"
 import { getGasBalanceMonitorService, } from "./services/gasBalanceMonitorService";
 import { sanitizeEnvironmentVariables } from "./config/environment";
 import { validateEnv } from "./utils/envValidator";
+import { refreshAllowedOrigins } from "./middleware/corsMiddleware";
 import { enableGlobalLogMasking } from "./utils/logMasker";
 import { hourlyAverageService } from "./services/hourlyAverageService";
 import { ohlcvAggregator } from "./jobs/ohlcvJob";
+import { apyWorker } from "./jobs/apyWorker";
 import { watchConfig } from "./config/configWatcher";
 import { startEnvFileWatcher } from "./config/envFileWatcher";
 import { validateDatabaseSchema } from "./utils/dbValidator";
@@ -30,8 +31,20 @@ import { registerTracingShutdownHandlers } from "./utils/shutdownTracing";
 import { providerSecretRotationService } from "./services/providerSecretRotationService";
 import { priceAggregatorService } from "./services/priceAggregatorService";
 import { contractSanityCheckService } from "./services/contractSanityCheckService";
+import { getCircuitBreakerService } from "./services/circuitBreakerService";
 import { governanceTimelockService } from "./services/governanceTimelockService";
+import { governanceWebhookBroadcaster } from "./services/governanceWebhookBroadcaster";
+import { getRegionalHealthService } from "./services/regionalHealthService";
 import { storageRentBumpService } from "./services/storageRentBumpService";
+import { getOrderBookSnapshotEngine } from "./services/orderBookSnapshotEngine";
+import { redisOperationsWorker } from "./services/redisOperationsWorker";
+import { initializeBridgeServices, stopBridgeServices } from "./services/bridgeIntegration";
+import { VolatilityService } from "./services/volatility.service";
+import { ArbitrageScanner } from "./services/arbitrageScanner";
+import { storageMonitorService } from "./services/storageMonitorService";
+import { complianceScreeningWorker } from "./services/complianceScreeningWorker";
+import { startDekRotationJob } from "./jobs/dekRotationJob";
+import { ledgerEventStreamWorker } from "./services/ledgerEventStreamWorker";
 // Load environment variables
 dotenv.config();
 // Normalize safe startup environment strings before runtime storage.
@@ -65,28 +78,27 @@ if (missingEnvVars.length > 0) {
     console.error("\nPlease set these variables in your .env file and restart the server.");
     process.exit(1);
 }
-const dashboardUrl = process.env.DASHBOARD_URL ||
-    process.env.FRONTEND_URL ||
-    "http://localhost:3000";
-if (!dashboardUrl) {
-    console.error("❌ Missing required environment variable: DASHBOARD_URL");
+// Issue #792 – Fail fast when the CORS allowlist is empty in production rather
+// than starting a server that rejects every browser client.
+const allowedOrigins = refreshAllowedOrigins();
+if (allowedOrigins.length === 0) {
+    console.error("❌ No CORS origins configured. Set CORS_ALLOWED_ORIGINS (comma-separated) or DASHBOARD_URL.");
     process.exit(1);
 }
+console.log(`🔒 CORS allowlist: ${allowedOrigins.join(", ")}`);
 const PORT = process.env.PORT || 3000;
-// Horizon server for health checks
-const stellarNetwork = getStellarNetwork();
-const horizonUrl = stellarNetwork === "PUBLIC"
-    ? "https://horizon.stellar.org"
-    : "https://horizon-testnet.stellar.org";
-const horizonServer = new Horizon.Server(horizonUrl);
-// Middleware
-app.use(cors());
-app.use(express.json());
+// Use shared StellarProvider for health checks (supports failover)
+const horizonServer = stellarProvider.getServer();
+// CORS, security headers and body parsing are configured once in app.ts.
+// Re-registering them here previously overwrote the strict allowlist with a
+// wildcard Access-Control-Allow-Origin.
 // Routes
 app.use("/api/market-rates", marketRatesRouter);
 app.use("/api/history", historyRouter);
 app.use("/api/price-updates", priceUpdatesRouter);
 app.use("/api/stats", statsRouter);
+app.use("/api/v1/bridge", bridgeRouter);
+app.use("/api/v1/vaults", vaultRoutes);
 // Health check endpoint
 /**
  * @swagger
@@ -123,28 +135,14 @@ app.use("/api/stats", statsRouter);
  *       '503':
  *         description: One or more services unavailable
  */
-app.get("/health", async (req, res) => {
+app.get("/health", async (_req, res) => {
+    const watchdog = await systemHealthWatchdog.runOnce();
     const checks = {
-        database: false,
-        horizon: false,
+        database: watchdog.checks.database?.status === "healthy",
+        horizon: watchdog.checks.horizon?.status === "healthy",
+        soroban: watchdog.checks.soroban?.status === "healthy",
     };
-    // Check database connectivity
-    try {
-        await prisma.$queryRaw `SELECT 1`;
-        checks.database = true;
-    }
-    catch {
-        checks.database = false;
-    }
-    // Check Stellar Horizon reachability
-    try {
-        await horizonServer.root();
-        checks.horizon = true;
-    }
-    catch {
-        checks.horizon = false;
-    }
-    const healthy = checks.database && checks.horizon;
+    const healthy = watchdog.status === "healthy";
     res.status(healthy ? 200 : 503).json({
         success: healthy,
         message: healthy
@@ -152,6 +150,7 @@ app.get("/health", async (req, res) => {
             : "One or more services unavailable",
         timestamp: new Date().toISOString(),
         checks,
+        watchdog,
     });
 });
 // Root endpoint
@@ -190,6 +189,8 @@ app.get("/", (req, res) => {
         version: "1.0.0",
         endpoints: {
             health: "/health",
+            liveness: "/health/liveness",
+            readiness: "/health/readiness",
             marketRates: {
                 allRates: "/api/v1/market-rates/rates",
                 singleRate: "/api/v1/market-rates/rate/:currency",
@@ -213,6 +214,15 @@ app.get("/", (req, res) => {
                 priceChange: "/api/v1/intelligence/price-change/:currency",
                 staleCurrencies: "/api/v1/intelligence/stale",
             },
+            bridge: {
+                chains: "/api/v1/bridge/chains",
+                validators: "/api/v1/bridge/validators",
+                events: "/api/v1/bridge/events",
+                operations: "/api/v1/bridge/operations",
+                queueStats: "/api/v1/bridge/queue/stats",
+                retry: "POST /api/v1/bridge/queue/retry",
+                simulate: "POST /api/v1/bridge/simulate",
+            },
         },
     });
 });
@@ -221,9 +231,31 @@ const httpServer = createServer(app);
 initSocket(httpServer);
 const liquidityRebalancingWorker = startLiquidityRebalancingWorker();
 let sorobanEventListener = null;
+systemHealthWatchdog.registerWorker({
+    name: "redis-operations",
+    getLastHeartbeatAt: () => redisOperationsWorker.getLastHeartbeatAt(),
+    heartbeatTimeoutMs: redisOperationsWorker.getHeartbeatTimeoutMs(),
+    restart: () => {
+        redisOperationsWorker.stop();
+        await ledgerEventStreamWorker.stop();
+        redisOperationsWorker.start();
+    },
+});
+if (liquidityRebalancingWorker) {
+    systemHealthWatchdog.registerWorker({
+        name: "liquidity-rebalancing",
+        getLastHeartbeatAt: () => liquidityRebalancingWorker.getLastHeartbeatAt(),
+        heartbeatTimeoutMs: liquidityRebalancingWorker.getHeartbeatTimeoutMs(),
+        restart: () => {
+            liquidityRebalancingWorker.stop();
+            liquidityRebalancingWorker.start();
+        },
+    });
+}
 // FIX 1: Typed as nullable — constructor is not called at module level,
 // so a missing secret env var won't crash the process before the server starts.
 let gasBalanceMonitorService = null;
+const circuitBreakerService = getCircuitBreakerService();
 let isShuttingDown = false;
 let stopEnvFileWatcher;
 const stopConfigWatcher = watchConfig((cfg) => {
@@ -258,15 +290,26 @@ const shutdown = async (signal) => {
         sorobanEventListener?.stop();
         multiSigSubmissionService.stop();
         governanceTimelockService.stop();
+        governanceWebhookBroadcaster.stop();
         liquidityRebalancingWorker?.stop();
+        apyWorker.stop();
+        storageMonitorService.stop(); // <--- ADDED
+        systemHealthWatchdog.stop();
         // FIX 2: Optional chaining — safe to call even if service never started
         gasBalanceMonitorService?.stop();
+        circuitBreakerService.stop();
         hourlyAverageService.stop();
         priceAggregatorService.stop();
         providerSecretRotationService.stop();
         storageRentBumpService.stop();
+        redisOperationsWorker.stop();
+        complianceScreeningWorker.stop();
+        getOrderBookSnapshotEngine().stop();
+        VolatilityService.stop();
+        ArbitrageScanner.stop();
         stopConfigWatcher();
         stopEnvFileWatcher?.();
+        await stopBridgeServices();
         await closeHttpServer();
         console.log("HTTP server closed.");
         await prisma.$disconnect();
@@ -297,9 +340,37 @@ httpServer.listen(PORT, async () => {
     console.log(`📊 Market Rates API available at http://localhost:${PORT}/api/market-rates`);
     console.log(`📚 API Documentation available at http://localhost:${PORT}/api/docs`);
     console.log(`🏥 Health check at http://localhost:${PORT}/health`);
+    console.log(`💓 Liveness probe at http://localhost:${PORT}/health/liveness`);
+    console.log(`✅ Readiness probe at http://localhost:${PORT}/health/readiness`);
     console.log(`🔌 Socket.io ready for dashboard connections`);
     redisOperationsWorker.start();
     console.log(`🧹 Redis operations worker started`);
+    void ledgerEventStreamWorker.start().catch((err) => {
+        console.error("Failed to start ledger event stream worker:", err);
+    });
+    console.log(`📡 Ledger event stream worker started`);
+    complianceScreeningWorker.start();
+    console.log(`🛡️ Compliance screening worker started`);
+    // Start PostgreSQL storage footprint monitor (Issue #813)
+    try {
+        storageMonitorService.start();
+        console.log(`💾 Storage monitor service started`);
+    }
+    catch (err) {
+        console.warn("Storage monitor service not started:", err instanceof Error ? err.message : err);
+    }
+    // Start the order book snapshot engine (Issue #796)
+    try {
+        getOrderBookSnapshotEngine()
+            .start()
+            .catch((err) => {
+            console.error("Failed to start order book snapshot engine:", err);
+        });
+        console.log(`📖 Order book snapshot engine started`);
+    }
+    catch (err) {
+        console.warn("Order book snapshot engine not started:", err instanceof Error ? err.message : err);
+    }
     // Perform contract sanity check before starting ingestion loop
     let contractSanityPassed = true;
     if (contractSanityCheckService.isConfigured()) {
@@ -325,6 +396,13 @@ httpServer.listen(PORT, async () => {
     if (contractSanityPassed) {
         try {
             sorobanEventListener = new SorobanEventListener();
+            systemHealthWatchdog.registerQueue({
+                name: "soroban-event-ingestion",
+                getDepth: () => sorobanEventListener?.getQueueDepth() ?? 0,
+                maxHealthyDepth: Number(process.env.WATCHDOG_INGESTION_QUEUE_MAX_DEPTH) > 0
+                    ? Number(process.env.WATCHDOG_INGESTION_QUEUE_MAX_DEPTH)
+                    : 800,
+            });
             sorobanEventListener.start().catch((err) => {
                 console.error("Failed to start event listener:", err);
             });
@@ -350,6 +428,13 @@ httpServer.listen(PORT, async () => {
             console.warn("Multi-sig submission service not started:", err instanceof Error ? err.message : err);
         }
     }
+    // Start cross-chain bridge services if enabled
+    try {
+        await initializeBridgeServices();
+    }
+    catch (err) {
+        console.warn("Cross-chain bridge services not started:", err instanceof Error ? err.message : err);
+    }
     try {
         governanceTimelockService.start().catch((err) => {
             console.error("Failed to start governance timelock service:", err);
@@ -358,6 +443,15 @@ httpServer.listen(PORT, async () => {
     }
     catch (err) {
         console.warn("Governance timelock service not started:", err instanceof Error ? err.message : err);
+    }
+    try {
+        governanceWebhookBroadcaster.start().catch((err) => {
+            console.error("Failed to start governance webhook broadcaster:", err);
+        });
+        console.log("Governance webhook broadcaster started");
+    }
+    catch (err) {
+        console.warn("Governance webhook broadcaster not started:", err instanceof Error ? err.message : err);
     }
     // Start background hourly average job
     try {
@@ -368,6 +462,9 @@ httpServer.listen(PORT, async () => {
         // Start OHLCV aggregator
         ohlcvAggregator.start();
         console.log(`📈 OHLCV aggregator started`);
+        // Start APY Calculation Worker
+        apyWorker.start();
+        console.log(`🏦 APY Calculation Worker started`);
     }
     catch (err) {
         console.warn("Hourly average service not started:", err instanceof Error ? err.message : err);
@@ -395,6 +492,19 @@ httpServer.listen(PORT, async () => {
     catch (err) {
         console.warn("Gas balance monitor service not started:", err instanceof Error ? err.message : err);
     }
+    // Invariant Violation Automated Circuit Breaker (Issue #829):
+    // monitors balance invariants off-chain and auto-submits a pause()
+    // transaction signed by the emergency keeper key when a CRITICAL breach
+    // is detected. Opt-in via CIRCUIT_BREAKER_ENABLED=true.
+    try {
+        circuitBreakerService.start().catch((err) => {
+            console.error("Failed to start circuit breaker service:", err);
+        });
+        console.log(`🚨 Circuit breaker service started`);
+    }
+    catch (err) {
+        console.warn("Circuit breaker service not started:", err instanceof Error ? err.message : err);
+    }
     // Start storage rent bump service
     try {
         storageRentBumpService.start().catch((err) => {
@@ -403,6 +513,29 @@ httpServer.listen(PORT, async () => {
     }
     catch (err) {
         console.warn("Storage rent bump service not started:", err instanceof Error ? err.message : err);
+    }
+    // Start DEK (Data Encryption Key) rotation job for relayer private keys
+    // Rotates encryption keys every 90 days for enhanced security
+    try {
+        startDekRotationJob(); // Runs daily at 2:00 AM UTC
+        console.log(`🔐 DEK rotation job scheduled (daily at 2:00 AM UTC)`);
+    }
+    catch (err) {
+        console.error("Failed to start DEK rotation job:", err);
+    }
+    // Start Volatility Service
+    try {
+        VolatilityService.start();
+    }
+    catch (err) {
+        console.error("Failed to start volatility service:", err);
+    }
+    // Start Arbitrage Scanner
+    try {
+        ArbitrageScanner.start();
+    }
+    catch (err) {
+        console.error("Failed to start arbitrage scanner:", err);
     }
 });
 export default app;

@@ -3,7 +3,7 @@
  * zeroisation and tamper-evident state persistence.
  */
 import fs from "node:fs";
-import { KeyKeeper, SecretNotFoundError } from "../src/state/keeper";
+import { KeyKeeper, SecretNotFoundError } from "../../src/state/keeper";
 import type { LayerResult } from "./releaseReport";
 import { ReleaseReport } from "./releaseReport";
 

@@ -4,7 +4,11 @@ import os
 
 from celery import Celery
 from celery.schedules import crontab
+from kombu import Exchange, Queue
 
+from app.sentry import init_sentry
+
+init_sentry()
 
 celery_app = Celery(
     "stellarflow",
@@ -20,7 +24,30 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
     task_track_started=True,
+    task_queues=(
+        Queue("webhook.retry", Exchange("webhook"), routing_key="webhook.retry", durable=True),
+        Queue("webhook.dead", Exchange("webhook"), routing_key="webhook.dead", durable=True),
+        Queue("index-shielded-notes", Exchange("shielded"), routing_key="shielded.index", durable=True),
+    ),
+    task_routes={
+        "app.tasks.deliver_webhook_task": {
+            "queue": "webhook.retry",
+            "routing_key": "webhook.retry",
+        },
+        "app.tasks.webhook_dead_letter_task": {
+            "queue": "webhook.dead",
+            "routing_key": "webhook.dead",
+        },
+        "app.tasks.index_shielded_notes_range": {
+            "queue": "index-shielded-notes",
+            "routing_key": "shielded.index",
+        },
+    },
     beat_schedule={
+        "poll-anchor-settlement-statuses": {
+            "task": "app.tasks.poll_anchor_settlement_statuses",
+            "schedule": 30.0,
+        },
         "aggregate-minute-analytics": {
             "task": "app.tasks.aggregate_ledger_analytics",
             "schedule": crontab(minute="*/5"),
@@ -35,6 +62,34 @@ celery_app.conf.update(
             "task": "app.tasks.aggregate_ledger_analytics",
             "schedule": crontab(minute="*/15"),
             "kwargs": {"granularity": "DAY", "lookback_hours": 73},
+        },
+        "ingest-flash-loan-revenue": {
+            "task": "app.tasks.ingest_flash_loan_revenue",
+            "schedule": crontab(minute="*/5"),
+            "kwargs": {"lookback_minutes": 60},
+        },
+        "compute-daily-yield-snapshots": {
+            "task": "app.tasks.compute_yield_snapshots",
+            "schedule": crontab(minute="*/15"),
+            "kwargs": {"granularity": "DAILY"},
+        },
+        "compute-hourly-yield-snapshots": {
+            "task": "app.tasks.compute_yield_snapshots",
+            "schedule": crontab(minute="*/5"),
+            "kwargs": {"granularity": "HOURLY"},
+        },
+        "stake-treasury-idle-balances": {
+            "task": "app.tasks.stake_treasury_idle_balances",
+            "schedule": crontab(minute="0", hour="*/6"),
+        },
+        "generate-treasury-yield-report": {
+            "task": "app.tasks.generate_treasury_yield_report",
+            "schedule": crontab(minute="0", hour="0", day_of_month="1"),
+        },
+        # Issue #979 — purge temp CSV / PDF exports older than 24 h every day at 02:00 UTC
+        "purge-s3-temp-exports": {
+            "task": "app.tasks.purge_s3_temp_exports",
+            "schedule": crontab(minute="0", hour="2"),
         },
     },
 )

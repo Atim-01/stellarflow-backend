@@ -2,7 +2,7 @@ import express, { Request, Response } from "express";
 import { sendApiError } from "../lib/apiError";
 import { multiSigService } from "../services/multiSigService";
 import { isLockdownError } from "../state/appState";
-import { sanitizeMultiSigSignaturePayload } from "../middleware/payloadSanitizer";
+import { sanitizeSignatureRequest } from "../middleware/payloadSanitizer";
 
 const router = express.Router();
 
@@ -24,7 +24,7 @@ const router = express.Router();
  */
 router.post(
   "/sign",
-  sanitizeMultiSigSignaturePayload,
+  sanitizeSignatureRequest,
   async (req: Request, res: Response) => {
     try {
       const { multiSigPriceId, signature, signerPublicKey, signerName } =

@@ -1,0 +1,26 @@
+# Capital Rebalancing System Dependencies
+# Add these to your main requirements.txt file
+
+# Convex optimization library for portfolio optimization
+# Optional but highly recommended for production use
+# Falls back to proportional allocation if not installed
+cvxpy>=1.4.0
+
+# ECOS solver (recommended for CVXPY)
+ecos>=2.0.0
+
+# SCS solver (alternative to ECOS)
+scs>=3.2.0
+
+# NumPy (required by CVXPY, likely already installed)
+numpy>=1.24.0
+
+# Existing dependencies (should already be in requirements.txt)
+# fastapi>=0.100.0
+# sqlalchemy>=2.0.0
+# asyncpg>=0.28.0
+# redis>=4.5.0
+# celery>=5.3.0
+# structlog>=23.1.0
+# pydantic>=2.0.0
+# alembic>=1.11.0
