@@ -362,6 +362,7 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     complianceScreeningWorker.stop();
     getOrderBookSnapshotEngine().stop();
     VolatilityService.stop();
+    DynamicFeeAdjusterService.stop();
     ArbitrageScanner.stop();
     stopConfigWatcher();
     stopEnvFileWatcher?.();
@@ -647,6 +648,13 @@ httpServer.listen(PORT, async () => {
     VolatilityService.start();
   } catch (err) {
     console.error("Failed to start volatility service:", err);
+  }
+
+  // Start Dynamic Fee Adjuster
+  try {
+    DynamicFeeAdjusterService.start();
+  } catch (err) {
+    console.error("Failed to start dynamic fee adjuster:", err);
   }
 
   // Start Arbitrage Scanner
