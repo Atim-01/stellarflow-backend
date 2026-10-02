@@ -15,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.shielded import MerkleRoot, ShieldedCommitment
+from app.security.proof_encryption import ProofEncryptor
 
 # Prometheus metric setup
 try:
@@ -57,6 +58,9 @@ class MerkleService:
     """Service to compute and persist incremental Merkle roots for shielded notes."""
 
     TREE_DEPTH: ClassVar[int] = 20
+
+    def __init__(self, encryptor: ProofEncryptor | None = None) -> None:
+        self._encryptor = encryptor
 
     @classmethod
     def get_zero_value(cls, level: int = 0) -> str:
@@ -213,6 +217,13 @@ class MerkleService:
             leaf_count=leaf_count,
             ledger_sequence=target_ledger_seq,
             tree_state=tree_state,
+            encrypted_tree_state=(
+                self._encryptor.encrypt(
+                    tree_state, associated_data=f"tree:{target_ledger_seq}"
+                ).as_dict()
+                if self._encryptor is not None
+                else None
+            ),
         )
         session.add(merkle_root_row)
         merkle_root_updates_total.inc()
