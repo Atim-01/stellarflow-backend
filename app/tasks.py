@@ -21,6 +21,7 @@ from app.services.webhook_retry import (
     WEBHOOK_DLQ_QUEUE,
     run_delivery,
 )
+from app.security.proof_encryption import proof_encryptor_from_environment
 
 class DatabaseTask(Task):
     """Base task that exposes the configured PostgreSQL connection string."""
@@ -740,8 +741,9 @@ async def _index_range(start_ledger: int, end_ledger: int) -> dict[str, int]:
             )
 
         async with async_session_factory() as session:
-            note_parser = NoteParser()
-            merkle_service = MerkleService()
+            proof_encryptor = proof_encryptor_from_environment()
+            note_parser = NoteParser(proof_encryptor)
+            merkle_service = MerkleService(proof_encryptor)
 
             commitments_indexed, nullifiers_indexed = await note_parser.parse_batch(session, events)
 

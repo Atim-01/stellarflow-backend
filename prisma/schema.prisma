@@ -363,8 +363,50 @@ model Relayer {
   permissionChanges PermissionChange[]
   sessions          UserSession[]
   registry          RelayerRegistry?
+  watchlist         WatchlistItem[]
+  notificationPreference UserNotificationPreference?
+  pushSubscriptions PushSubscription[]
   
   @@index([dekRotationScheduledAt])
+}
+
+model WatchlistItem {
+  id             String   @id @default(uuid())
+  userId         Int
+  user            Relayer  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token          String
+  targetPrice    Decimal  @db.Decimal(38, 18)
+  direction      String   @default("ABOVE")
+  isActive       Boolean  @default(true)
+  lastTriggeredAt DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([userId, token])
+  @@index([userId, isActive])
+}
+
+model UserNotificationPreference {
+  id        String   @id @default(uuid())
+  userId    Int      @unique
+  user      Relayer  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  emailEnabled Boolean @default(true)
+  pushEnabled  Boolean @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model PushSubscription {
+  id        String   @id @default(uuid())
+  userId    Int
+  user      Relayer  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  endpoint  String   @unique
+  p256dh    String
+  auth      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
 }
 
 model RelayerRegistry {
