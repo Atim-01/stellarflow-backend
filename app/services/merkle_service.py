@@ -15,7 +15,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.shielded import MerkleRoot, ShieldedCommitment
-from app.services.native_merkle import NativeMerkle, NativeMerkleError
+from app.security.proof_encryption import ProofEncryptor
 
 try:
     from prometheus_client import Counter
@@ -65,6 +65,9 @@ class MerkleService:
                     raise
                 log.warning("shielded_merkle.native_unavailable", fallback="python_reference")
         return cls._native
+
+    def __init__(self, encryptor: ProofEncryptor | None = None) -> None:
+        self._encryptor = encryptor
 
     @classmethod
     def get_zero_value(cls, level: int = 0) -> str:
@@ -171,19 +174,35 @@ class MerkleService:
         await session.execute(text("SELECT pg_advisory_xact_lock(83421901)"))
         if (await session.execute(select(MerkleRoot).where(MerkleRoot.ledger_sequence == target))).scalar_one_or_none() is not None:
             return None
-        ordered = sorted(new_commitments, key=lambda item: item.leaf_index)
-        previous = (await session.execute(select(MerkleRoot).order_by(MerkleRoot.leaf_count.desc()).limit(1))).scalar_one_or_none()
-        start = previous.leaf_count if previous is not None else 0
-        if [item.leaf_index for item in ordered] != list(range(start, start + len(ordered))):
-            raise ValueError("shielded commitments are not the next contiguous leaves")
-        all_rows = (await session.execute(select(ShieldedCommitment.commitment).order_by(ShieldedCommitment.leaf_index.asc()))).all()
-        all_leaves = [row[0] for row in all_rows]
-        if len(all_leaves) > 1 << depth or all_leaves[start:start + len(ordered)] != [item.commitment for item in ordered]:
-            raise ValueError("shielded commitment persistence does not match requested tree update")
-        count, frontier = self._state_for_checkpoint(previous, all_leaves[:start], depth)
-        root, frontier = self._append(frontier, count, [item.commitment for item in ordered], depth)
-        row = MerkleRoot(merkle_root=root, leaf_count=count + len(ordered), ledger_sequence=target, tree_state={"version": 1, "hash_scheme": HASH_SCHEME, "depth": depth, "frontier": frontier})
-        session.add(row)
+
+        # Fetch all commitments up to this point in leaf_index order
+        all_comm_stmt = (
+            select(ShieldedCommitment.commitment)
+            .order_by(ShieldedCommitment.leaf_index.asc())
+        )
+        all_comm_res = await session.execute(all_comm_stmt)
+        all_leaves = [row[0] for row in all_comm_res.all()]
+
+        new_root_hex = self.compute_root_from_leaves(all_leaves, depth=self.TREE_DEPTH)
+        leaf_count = len(all_leaves)
+
+        # Frontier state for incremental tree (first 20 level representative hashes)
+        tree_state = {"frontier": [self.get_zero_value(i) for i in range(self.TREE_DEPTH)], "depth": self.TREE_DEPTH}
+
+        merkle_root_row = MerkleRoot(
+            merkle_root=new_root_hex,
+            leaf_count=leaf_count,
+            ledger_sequence=target_ledger_seq,
+            tree_state=tree_state,
+            encrypted_tree_state=(
+                self._encryptor.encrypt(
+                    tree_state, associated_data=f"tree:{target_ledger_seq}"
+                ).as_dict()
+                if self._encryptor is not None
+                else None
+            ),
+        )
+        session.add(merkle_root_row)
         merkle_root_updates_total.inc()
         log.info("merkle_root.updated", leaf_count=row.leaf_count, ledger_sequence=target)
         return row

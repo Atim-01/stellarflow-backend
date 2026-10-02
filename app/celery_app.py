@@ -6,6 +6,8 @@ from celery import Celery
 from celery.schedules import crontab
 from kombu import Exchange, Queue
 
+from app.sentry import init_sentry
+
 init_sentry()
 
 celery_app = Celery(
@@ -83,6 +85,11 @@ celery_app.conf.update(
         "generate-treasury-yield-report": {
             "task": "app.tasks.generate_treasury_yield_report",
             "schedule": crontab(minute="0", hour="0", day_of_month="1"),
+        },
+        # Issue #979 — purge temp CSV / PDF exports older than 24 h every day at 02:00 UTC
+        "purge-s3-temp-exports": {
+            "task": "app.tasks.purge_s3_temp_exports",
+            "schedule": crontab(minute="0", hour="2"),
         },
     },
 )
