@@ -10,6 +10,7 @@ import { verifyOrderFilledEvent } from "./orderFillVerificationService.js";
 import { ingestGovernanceVoteEvent } from "./voterHistoryService.js";
 import { getCacheInvalidationManager } from "../cache/CacheInvalidationManager";
 import { getOrderBookSnapshotEngine } from "./orderBookSnapshotEngine";
+import { getAmmReserveDivergenceDetector } from "./ammReserveDivergenceDetector";
 
 dotenv.config();
 
@@ -156,6 +157,15 @@ export class SorobanEventListener {
           orderBookSnapshotEngine.onNewLedger(price.ledgerSeq).catch((err: unknown) => {
             logger.error("[EventListener] Order book snapshot failed:", err);
           });
+
+          getAmmReserveDivergenceDetector()
+            ?.onNewLedger(price.ledgerSeq)
+            .catch((err: unknown) => {
+              logger.error(
+                "[EventListener] AMM reserve divergence check failed:",
+                err,
+              );
+            });
         } catch (err) {
           logger.error("[Worker] Failed to process queued price:", err);
         }
@@ -172,6 +182,7 @@ export class SorobanEventListener {
 
       await this.pollOrderFilledEvents();
       await this.pollGovernanceVoteEvents();
+      await this.pollCircuitBreakerEvents();
 
       const transactions = await this.server
         .transactions()
@@ -301,6 +312,91 @@ export class SorobanEventListener {
           "[EventListener] Failed to ingest GovernanceVoted event:",
           err,
         );
+      }
+    }
+  }
+
+  /**
+   * Polls Soroban for Pause and CircuitBreakerTriggered events emitted by the contract
+   * and dispatches webhook notifications to registered endpoints.
+   *
+   * Expected event topics: ["Pause"] or ["CircuitBreakerTriggered", reason]
+   * Expected event data: varies by event type
+   */
+  private async pollCircuitBreakerEvents(): Promise<void> {
+    const contractId = process.env.CONTRACT_ID?.trim();
+    if (!contractId) return;
+
+    const rpc = stellarProvider.getRpcServer() as any;
+
+    let response: { events?: any[] };
+    try {
+      response = await rpc.getEvents({
+        startLedger: Math.max(1, this.lastProcessedLedger),
+        filters: [
+          {
+            type: "contract",
+            contractIds: [contractId],
+            topics: [["Pause"], ["CircuitBreakerTriggered", "*"]],
+          },
+        ],
+        limit: 100,
+      });
+    } catch (err) {
+      logger.networkError("[EventListener] Circuit breaker events poll failed:", { err });
+      return;
+    }
+
+    for (const event of response.events ?? []) {
+      try {
+        const topics: string[] = event.topic ?? [];
+        const eventName = topics[0];
+
+        if (eventName !== "Pause" && eventName !== "CircuitBreakerTriggered") {
+          continue;
+        }
+
+        const txHash: string = event.txHash ?? event.id ?? "";
+        const ledger: number = Number(event.ledger ?? 0);
+        const closedAt: Date = event.ledgerClosedAt
+          ? new Date(event.ledgerClosedAt)
+          : new Date();
+
+        // Parse event data
+        const dataVal = event.value?.value ?? event.value ?? {};
+        const details: Record<string, unknown> = {};
+
+        if (eventName === "CircuitBreakerTriggered") {
+          // Expected data: { reason: string, triggerPrice?: number, threshold?: number }
+          details.reason = dataVal.reason ?? "Unknown";
+          if (dataVal.triggerPrice !== undefined) details.triggerPrice = dataVal.triggerPrice;
+          if (dataVal.threshold !== undefined) details.threshold = dataVal.threshold;
+          if (topics[1]) details.triggerType = topics[1];
+        } else if (eventName === "Pause") {
+          // Expected data: { pausedBy: string, reason?: string }
+          details.pausedBy = dataVal.pausedBy ?? "Unknown";
+          if (dataVal.reason !== undefined) details.reason = dataVal.reason;
+        }
+
+        const cbEvent: CircuitBreakerEvent = {
+          eventType: eventName as "Pause" | "CircuitBreakerTriggered",
+          contractId,
+          transactionHash: txHash,
+          ledger,
+          timestamp: closedAt,
+          details,
+        };
+
+        // Dispatch webhook notification
+        await circuitBreakerWebhookService.dispatchEvent(cbEvent);
+
+        logger.info(
+          `[EventListener] Processed ${eventName} event from ledger ${ledger}, tx: ${txHash}`,
+        );
+
+        if (ledger > this.lastProcessedLedger) this.lastProcessedLedger = ledger;
+      } catch (err) {
+        logger.error("[EventListener] Failed to process circuit breaker event:", err);
       }
     }
   }

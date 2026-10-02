@@ -6,6 +6,8 @@ from celery import Celery
 from celery.schedules import crontab
 from kombu import Exchange, Queue
 
+from app.sentry import init_sentry
+
 init_sentry()
 
 celery_app = Celery(
