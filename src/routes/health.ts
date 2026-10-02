@@ -1,12 +1,15 @@
 import { Router } from "express";
 import {
   getReadinessReport,
+  probeHsm,
   READINESS_UNAVAILABLE_STATUS,
   type ReadinessReport,
+  type ProbeResult,
 } from "../services/healthProbeService";
 
 export function createHealthRouter(
   loadReadiness: () => Promise<ReadinessReport> = getReadinessReport,
+  loadHsmHealth: () => Promise<ProbeResult> = probeHsm,
 ) {
   const router = Router();
 
@@ -42,6 +45,29 @@ export function createHealthRouter(
       status: "ready",
       timestamp: report.timestamp,
       checks: report.checks,
+    });
+  });
+
+  /**
+   * Automated HSM Hardware Status & Token Presence Probe endpoint
+   */
+  router.get("/hsm", async (_req, res) => {
+    const result = await loadHsmHealth();
+
+    if (!result.healthy) {
+      res.status(503).json({
+        success: false,
+        status: "unhealthy",
+        error: result.error || "HSM hardware or token check failed",
+        details: result.details,
+      });
+      return;
+    }
+
+    res.status(200).json({
+      success: true,
+      status: "healthy",
+      details: result.details,
     });
   });
 

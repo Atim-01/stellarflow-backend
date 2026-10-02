@@ -28,6 +28,7 @@
     "db:migrate": "prisma migrate dev",
     "db:studio": "prisma studio",
     "db:seed": "tsx prisma/seed.ts",
+    "db:governance-turnout": "prisma db execute --file prisma/governance_turnout_aggregate.sql",
     "db:validate": "python3 scripts/validate_migrations.py",
     "verify:keys": "tsx scripts/verify-no-plaintext-keys.ts",
     "test:migrations": "python3 -m pytest tests/test_alembic_migrations.py",
@@ -99,9 +100,9 @@
     "swagger-ui-express": "^5.0.1",
     "ts-node": "^10.9.2",
     "tweetnacl": "^1.0.3",
-    "typescript": "^5.9.3",
     "winston": "^3.19.0",
-    "winston-daily-rotate-file": "^5.0.0"
+    "winston-daily-rotate-file": "^5.0.0",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@types/amqplib": "^0.10.8",
@@ -125,6 +126,7 @@
     "prisma": "^7.8.0",
     "ts-jest": "^29.4.12",
     "tsx": "^4.21.0",
-    "typedoc": "^0.28.18"
+    "typedoc": "^0.28.18",
+    "typescript": "^6.0.3"
   }
 }
