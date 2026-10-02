@@ -45,6 +45,7 @@ import ordersRouter from "./routes/orders";
 import sorobanSimulationRouter from "./routes/sorobanSimulation";
 import sorobanRentEstimateRouter from "./routes/sorobanRentEstimate";
 import remittanceRouter from "./routes/remittance";
+import kycRouter from "./routes/kyc";
 import userConversionsRouter from "./routes/userConversions";
 import paymentRoutingRouter from "./routes/paymentRouting";
 import anchorsRouter from "./routes/anchors";
@@ -181,6 +182,10 @@ app.use("/api/v1/treasury", treasuryRouter);
 
 // Issue #815 – Remittance transaction history endpoint
 app.use("/api/v1/remittance", remittanceRouter);
+
+// Issue #990 – SEP-12 customer information transfer (KYC) endpoints
+app.use("/api/v1/kyc", kycRouter);
+
 app.use("/api/v1/users", userConversionsRouter);
 app.use("/api/v1/payment-routing", paymentRoutingRouter);
 
