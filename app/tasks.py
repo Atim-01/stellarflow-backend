@@ -797,6 +797,49 @@ def index_shielded_notes_range(
 
 
 
+# ---------------------------------------------------------------------------
+# Issue #979 — Asynchronous S3 Media & PDF Export Cleaner Worker
+# ---------------------------------------------------------------------------
+
+
+@celery_app.task(
+    bind=True,
+    base=DatabaseTask,
+    name="app.tasks.purge_s3_temp_exports",
+    autoretry_for=(OSError,),
+    retry_backoff=True,
+    max_retries=3,
+)
+def purge_s3_temp_exports(
+    self: DatabaseTask,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Daily worker that scans S3 and deletes temporary CSV/PDF export files.
+
+    Purges objects in the ``stellarflow-temp-exports`` bucket (configurable via
+    ``S3_TEMP_EXPORTS_BUCKET``) whose ``LastModified`` timestamp is older than
+    24 hours (configurable via ``S3_TEMP_EXPORTS_TTL_HOURS``).
+
+    Logs total objects deleted and total storage space reclaimed on each run.
+
+    Parameters
+    ----------
+    dry_run:
+        When ``True`` the task scans and reports stale objects without actually
+        deleting them.  Overridden by the ``S3_CLEANER_DRY_RUN`` env var when
+        both are set to ``True``.
+
+    Returns
+    -------
+    dict[str, Any]
+        Structured cleanup run summary (bucket, objects_deleted,
+        bytes_reclaimed, errors, timestamps, …).
+    """
+    from app.services.s3_export_cleaner import run_s3_export_cleanup
+
+    return run_s3_export_cleanup(dry_run=dry_run)
+
+
 @celery_app.task(
     bind=True,
     base=DatabaseTask,
