@@ -57,6 +57,7 @@ import { sendApiError } from "./lib/apiError.js";
 import metricsRouter from "./routes/metrics";
 import watchlistRouter from "./routes/watchlist";
 import treasuryRouter from "./routes/treasury";
+import marketStreamRouter from "./routes/marketStream";
 
 dotenv.config();
 
@@ -172,7 +173,7 @@ app.use("/api/v1/derived-assets", derivedAssetsRouter);
 app.use("/api/v1/sanity-check", sanityCheckRouter);
 app.use("/api/v1/cache", cacheMetricsRouter);
 
-// Issue #208 – Analytics / OHLC time-series endpoint
+// Issue #208 – Analytics / OHL  time-series endpoint
 app.use("/api/v1/analytics", analyticsRouter);
 
 // Issue #786 – Gas & CPU instruction profiler daily averages
@@ -220,6 +221,9 @@ app.use("/api/v1/soroban/simulate", sorobanSimulationRouter);
 
 // Issue #813 Build Automated Storage Footprint Monitor for Managed PostgreSQL
 app.use("/metrics", metricsRouter);
+
+// Issue #1091 – High-Frequency Market Stream Aggregator
+app.use("/api/v1/market-stream", marketStreamRouter);
 
 app.get("/", (req, res) => {
   res.json({
@@ -272,6 +276,11 @@ app.get("/", (req, res) => {
         requestQuote: "POST /api/v1/payment-routing/quotes",
         lockQuote: "POST /api/v1/payment-routing/quotes/:id/lock",
         getQuote: "GET /api/v1/payment-routing/quotes/:id",
+      },
+marketStream: {
+        websocket: "ws://.../v1/market-stream?pairs=USDC-XLM,BTC-USDC",
+        metrics: "GET /api/v1/market-stream/metrics",
+        publish: "POST /api/v1/market-stream/publish",
       },
       yield: {
         emissions: "/api/v1/yield/emissions",
