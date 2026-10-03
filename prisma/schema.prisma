@@ -633,9 +633,17 @@ model GovernanceProposal {
   updatedAt       DateTime  @updatedAt
   votes           GovernanceVote[]
 
+  // Issue #1019 – immutable IPFS snapshot of the final vote result
+  resultExportCid         String?
+  resultExportContentHash String?
+  resultExportedAt        DateTime?
+  resultExportAttempts    Int      @default(0)
+  resultExportError       String?
+
   @@index([status, expiresAt])
   @@index([contractId])
   @@index([actionType])
+  @@index([status, resultExportCid])
 }
 
 enum RebalancingSwapStatus {

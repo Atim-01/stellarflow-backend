@@ -41,6 +41,7 @@ import { contractSanityCheckService } from "./services/contractSanityCheckServic
 import { getCircuitBreakerService } from "./services/circuitBreakerService";
 import { governanceTimelockService } from "./services/governanceTimelockService";
 import { governanceWebhookBroadcaster } from "./services/governanceWebhookBroadcaster";
+import { governanceResultExportWorker } from "./services/governanceResultExportWorker";
 import { getRegionalHealthService } from "./services/regionalHealthService";
 import { storageRentBumpService } from "./services/storageRentBumpService";
 import { getOrderBookSnapshotEngine } from "./services/orderBookSnapshotEngine";
@@ -364,6 +365,7 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     multiSigSubmissionService.stop();
     governanceTimelockService.stop();
     governanceWebhookBroadcaster.stop();
+    governanceResultExportWorker.stop();
     liquidityRebalancingWorker?.stop();
     ammReserveDivergenceDetector?.stop();
     apyWorker.stop();
@@ -639,6 +641,17 @@ httpServer.listen(PORT, async () => {
   } catch (err) {
     console.warn(
       "Governance webhook broadcaster not started:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+
+  // Issue #1019 – export final governance vote results to IPFS
+  try {
+    governanceResultExportWorker.start();
+    console.log("Governance result export worker started");
+  } catch (err) {
+    console.warn(
+      "Governance result export worker not started:",
       err instanceof Error ? err.message : err,
     );
   }
