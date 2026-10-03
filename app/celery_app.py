@@ -100,6 +100,11 @@ celery_app.conf.update(
             "schedule": crontab(minute="*/5"),
             "kwargs": {"granularity": "HOURLY"},
         },
+        "auto-rebalance-capital": {
+            # Re-evaluate the optimal allocation vector every 6 hours.
+            "task": "app.tasks.auto_rebalance_capital",
+            "schedule": crontab(minute="0", hour="*/6"),
+        },
         "stake-treasury-idle-balances": {
             "task": "app.tasks.stake_treasury_idle_balances",
             "schedule": crontab(minute="0", hour="*/6"),
