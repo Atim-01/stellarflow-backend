@@ -4,16 +4,16 @@
  * Mounted at: /api/v1/governance
  *
  * Endpoints:
- *   GET /api/v1/governance/voters/:account_id    – voter history + delegation tree
- *   GET /api/v1/governance/proposals/:proposal_id – proposal result + IPFS verification link
+ *   GET /api/v1/governance/voters/:account_id  – voter history + delegation tree
+ *   GET /api/v1/governance/analytics/turnout   – daily turnout % + category trends
  */
 
 import { Router } from "express";
+import { getVoterProfile, governanceVoterCache } from "../controllers/governanceController.js";
 import {
-  getVoterProfile,
-  governanceVoterCache,
-} from "../controllers/governanceController.js";
-import { getProposalResult } from "../controllers/governanceProposalController.js";
+  getGovernanceTurnout,
+  governanceTurnoutCache,
+} from "../controllers/governanceTurnoutController.js";
 
 const router = Router();
 
@@ -68,37 +68,7 @@ const router = Router();
  */
 router.get("/voters/:account_id", governanceVoterCache(), getVoterProfile);
 
-/**
- * @swagger
- * /api/v1/governance/proposals/{proposal_id}:
- *   get:
- *     tags:
- *       - Governance
- *     summary: Proposal detail with result verification link
- *     description: >
- *       Returns a governance proposal together with its final voting tally and
- *       voter participation. Once the export worker has published the
- *       immutable result snapshot to IPFS, the response also carries the
- *       content hash (CID) and a public gateway verification link for the
- *       snapshot document.
- *     parameters:
- *       - in: path
- *         name: proposal_id
- *         required: true
- *         schema:
- *           type: string
- *           maxLength: 128
- *         description: On-chain proposal identifier
- *     responses:
- *       '200':
- *         description: Proposal detail with IPFS verification link
- *       '400':
- *         description: Invalid proposal identifier
- *       '404':
- *         description: Proposal not found
- *       '500':
- *         description: Internal server error
- */
-router.get("/proposals/:proposal_id", getProposalResult);
+// Swagger docs for this route live on the handler in governanceTurnoutController.ts.
+router.get("/analytics/turnout", governanceTurnoutCache(), getGovernanceTurnout);
 
 export default router;

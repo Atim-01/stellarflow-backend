@@ -1,0 +1,217 @@
+name: Database Migration Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - 'alembic/**'
+      - 'app/models/**'
+      - 'tests/test_migration_ci_pipeline.py'
+      - 'tests/test_alembic_migrations.py'
+      - '.github/workflows/migration-tests.yml'
+
+jobs:
+  migration-ci-pipeline:
+    name: Migration Forward/Backward Cycle Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://testuser:testpass@localhost:5432/postgres
+      
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: 'pip'
+
+      - name: Install Alembic and dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install alembic sqlalchemy psycopg2-binary pytest pytest-asyncio
+
+      - name: Install project dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Wait for PostgreSQL
+        run: |
+          until pg_isready -h localhost -p 5432 -U testuser; do
+            echo "Waiting for PostgreSQL..."
+            sleep 2
+          done
+          echo "PostgreSQL is ready!"
+
+      - name: Run migration CI pipeline tests
+        run: |
+          python -m pytest tests/test_migration_ci_pipeline.py \
+            -v \
+            --tb=short \
+            --durations=10 \
+            -p no:warnings
+        timeout-minutes: 2
+
+      - name: Run migration governance tests
+        run: |
+          python -m pytest tests/test_alembic_migrations.py \
+            -v \
+            --tb=short \
+            -k "TestAdvisoryLockProtocol or TestMigrationGovernanceRules" \
+            -p no:warnings
+        timeout-minutes: 2
+
+  migration-performance-benchmark:
+    name: Migration Performance (< 30s requirement)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://testuser:testpass@localhost:5432/postgres
+      
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install alembic sqlalchemy psycopg2-binary pytest
+
+      - name: Install project dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run performance benchmark
+        run: |
+          python -m pytest tests/test_migration_ci_pipeline.py::test_ci_migration_benchmark \
+            -v \
+            -s \
+            --tb=short
+        timeout-minutes: 2
+
+      - name: Verify 30-second performance requirement
+        run: |
+          python -m pytest tests/test_migration_ci_pipeline.py::TestMigrationCIPipeline::test_migration_performance_under_30_seconds \
+            -v \
+            --tb=short
+        timeout-minutes: 2
+
+  migration-data-integrity:
+    name: Migration Data Integrity & Rollback Safety
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://testuser:testpass@localhost:5432/postgres
+      
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install alembic sqlalchemy psycopg2-binary pytest
+
+      - name: Install project dependencies
+        run: pip install -r requirements.txt
+
+      - name: Test data integrity through migration cycles
+        run: |
+          python -m pytest tests/test_migration_ci_pipeline.py::TestMigrationCIPipeline::test_full_migration_cycle_with_data_integrity \
+            -v \
+            --tb=short
+        timeout-minutes: 2
+
+      - name: Test SQL constraint error handling
+        run: |
+          python -m pytest tests/test_migration_ci_pipeline.py::TestMigrationCIPipeline::test_no_sql_constraint_errors_during_migrations \
+            -v \
+            --tb=short
+        timeout-minutes: 2
+
+      - name: Test idempotent migrations
+        run: |
+          python -m pytest tests/test_migration_ci_pipeline.py::TestMigrationCIPipeline::test_idempotent_upgrade_head \
+            -v \
+            --tb=short
+        timeout-minutes: 2
+
+  migration-summary:
+    name: Migration Test Summary
+    runs-on: ubuntu-latest
+    needs: [migration-ci-pipeline, migration-performance-benchmark, migration-data-integrity]
+    if: always()
+    
+    steps:
+      - name: Check all migration tests passed
+        run: |
+          if [ "${{ needs.migration-ci-pipeline.result }}" != "success" ] || \
+             [ "${{ needs.migration-performance-benchmark.result }}" != "success" ] || \
+             [ "${{ needs.migration-data-integrity.result }}" != "success" ]; then
+            echo "❌ One or more migration tests failed"
+            exit 1
+          fi
+          echo "✅ All migration tests passed successfully"

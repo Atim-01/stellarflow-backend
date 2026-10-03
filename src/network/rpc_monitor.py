@@ -595,6 +595,262 @@ class PredictiveFailoverRouter:
         return self.monitor.get_health_summary()
 
 
+
+
+# ---------------------------------------------------------------------------
+# Flash loan volatility circuit breaker (#1006)
+# ---------------------------------------------------------------------------
+
+#: Suspicious flash loans tolerated inside one ledger before the breaker trips.
+#: The issue specifies "more than 3", so the fourth trips it.
+FLASH_LOAN_BREAKER_THRESHOLD: int = 3
+
+#: A single flash loan larger than this share of pool liquidity is suspicious
+#: on its own, even if the count stays under the threshold.
+FLASH_LOAN_POOL_SHARE_THRESHOLD: float = 0.05
+
+
+@dataclass
+class FlashLoanObservation:
+    """One flash loan seen in the mempool, as reported by the listener."""
+
+    tx_hash: str
+    #: Ledger the loan was observed in; the breaker counts per ledger.
+    ledger: int
+    #: Borrowed amount, in the pool's units.
+    amount: float
+    #: Pool liquidity at the time of the observation.
+    pool_liquidity: float
+
+
+class FlashLoanCircuitBreaker:
+    """Trips when flash loan activity suggests an attack in progress.
+
+    The breaker is deliberately *detection and signalling* only. Firing the
+    administrative pause is an on-chain write that needs credentials and a
+    signer, so a callback is invoked rather than the contract being called
+    directly — the transport stays the caller's decision, and the caller is
+    never surprised by an on-chain write it did not arrange.
+    """
+
+    def __init__(
+        self,
+        pause_callback: Optional[Callable[[str], None]] = None,
+        alert_callback: Optional[Callable[[str], None]] = None,
+        count_threshold: int = FLASH_LOAN_BREAKER_THRESHOLD,
+        pool_share_threshold: float = FLASH_LOAN_POOL_SHARE_THRESHOLD,
+    ) -> None:
+        self._pause_callback = pause_callback
+        self._alert_callback = alert_callback
+        self._count_threshold = count_threshold
+        self._pool_share_threshold = pool_share_threshold
+        self._by_ledger: Dict[int, List[FlashLoanObservation]] = {}
+        self._tripped_ledgers: set = set()
+        self._trip_count: int = 0
+        self._lock = threading.Lock()
+
+    @property
+    def trip_count(self) -> int:
+        """How many times the breaker has tripped. Exported for metrics."""
+        with self._lock:
+            return self._trip_count
+
+    def record(self, observation: FlashLoanObservation) -> Optional[str]:
+        """Record one observation; return a trip reason, or None.
+
+        Observations from ledgers older than the one currently being tracked
+        are dropped rather than accumulated, so a listener that falls behind
+        cannot retroactively trip the breaker on stale history.
+        """
+        with self._lock:
+            # Only the newest ledger is tracked. Anything older is a replay or a
+            # late report, and folding it into the live count would let a lagging
+            # listener manufacture a trip out of history. Pruning is unconditional
+            # rather than gated on having tripped, so the map cannot accumulate one
+            # bucket per ledger seen.
+            newest = max(self._by_ledger) if self._by_ledger else None
+            if newest is not None:
+                if observation.ledger < newest:
+                    return None
+                if observation.ledger > newest:
+                    self._by_ledger.clear()
+
+            # Already tripped for this ledger: stay tripped, but do not notify
+            # again. Re-firing the pause and alert callbacks on every further
+            # loan would turn one attack into a notification flood and repeat
+            # an on-chain write that has already been requested.
+            if observation.ledger in self._tripped_ledgers:
+                return None
+
+            bucket = self._by_ledger.setdefault(observation.ledger, [])
+            bucket.append(observation)
+
+            reason: Optional[str] = None
+            if len(bucket) > self._count_threshold:
+                reason = (
+                    f"{len(bucket)} flash loans observed in ledger "
+                    f"{observation.ledger} (threshold {self._count_threshold})"
+                )
+            elif (
+                observation.pool_liquidity > 0
+                and observation.amount / observation.pool_liquidity
+                > self._pool_share_threshold
+            ):
+                share = observation.amount / observation.pool_liquidity
+                reason = (
+                    f"flash loan {observation.tx_hash[:12]} took {share:.2%} of pool "
+                    f"liquidity (threshold {self._pool_share_threshold:.0%})"
+                )
+
+            if reason is not None:
+                self._tripped_ledgers.add(observation.ledger)
+                self._trip_count += 1
+
+        if reason is not None:
+            logger.error("[FlashLoanBreaker] TRIPPED: %s", reason)
+            self._notify(reason)
+
+        return reason
+
+    def _notify(self, reason: str) -> None:
+        """Fan out to the pause and alert callbacks, isolating their failures.
+
+        A callback that raises must not take the monitor thread down with it,
+        which is exactly the failure mode that would leave the breaker unable to
+        report the next trip.
+        """
+        for name, callback in (
+            ("pause", self._pause_callback),
+            ("alert", self._alert_callback),
+        ):
+            if callback is None:
+                continue
+            try:
+                callback(reason)
+            except Exception as exc:  # noqa: BLE001 - callbacks are external
+                logger.error(
+                    "[FlashLoanBreaker] %s callback failed: %s", name, exc
+                )
+
+    def is_tripped(self, ledger: Optional[int] = None) -> bool:
+        with self._lock:
+            if ledger is None:
+                return bool(self._tripped_ledgers)
+            return ledger in self._tripped_ledgers
+
+    def reset(self) -> None:
+        with self._lock:
+            self._by_ledger.clear()
+            self._tripped_ledgers.clear()
+
+
+# ---------------------------------------------------------------------------
+# Soroban ledger footprint pre-flight inspector (#1017)
+# ---------------------------------------------------------------------------
+
+#: Footprint sections a Soroban transaction can declare.
+FOOTPRINT_SECTIONS = ("readOnly", "readWrite")
+
+#: Keys a caller must be able to declare for a contract invocation to succeed.
+#: Checked before submission so a missing declaration surfaces as a clear
+#: error instead of a footprint failure from the network.
+REQUIRED_CONTRACT_KEYS = ("contractInstance",)
+
+
+class FootprintError(ValueError):
+    """Raised when a transaction's declared footprint is incomplete."""
+
+
+def inspect_footprint(
+    footprint: Optional[Dict],
+    required_keys: tuple = REQUIRED_CONTRACT_KEYS,
+    allow_empty_footprint: bool = False,
+) -> List[str]:
+    """Validate a transaction envelope's declared ledger footprint.
+
+    Returns the list of problems found, which is empty when the footprint is
+    complete. A missing or malformed ``readOnly``/``readWrite`` pair is
+    reported rather than raised, so a caller inspecting a batch can report
+    every bad transaction in one pass.
+
+    `allow_empty_footprint` exists for genuinely read-only calls; without it an
+    empty footprint is treated as a declaration failure, because a contract
+    invocation that declares no keys at all cannot have read what it needs.
+    """
+    problems: List[str] = []
+
+    if footprint is None:
+        if allow_empty_footprint:
+            return problems
+        return ["transaction declares no ledger footprint"]
+
+    if not isinstance(footprint, dict):
+        return ["ledger footprint must be an object with readOnly/readWrite sections"]
+
+    for section in FOOTPRINT_SECTIONS:
+        value = footprint.get(section)
+        if value is None:
+            # Absent means "declared nothing in this section", which is legal;
+            # only a wrong type is a declaration error.
+            continue
+        if not isinstance(value, (list, tuple)):
+            problems.append(
+                f"footprint section '{section}' must be a list, got "
+                f"{type(value).__name__}"
+            )
+            continue
+        for index, key in enumerate(value):
+            if not isinstance(key, (str, bytes, dict)):
+                problems.append(
+                    f"footprint section '{section}' entry {index} is not a "
+                    f"ledger key: {type(key).__name__}"
+                )
+
+    declared = sum(
+        len(footprint.get(section) or [])
+        for section in FOOTPRINT_SECTIONS
+        if isinstance(footprint.get(section), (list, tuple))
+    )
+    if declared == 0 and not allow_empty_footprint:
+        problems.append(
+            "footprint declares no ledger keys; a contract invocation must "
+            "declare the keys it reads or writes"
+        )
+
+    for required in required_keys:
+        if not footprint_declares(footprint, required):
+            problems.append(
+                f"required footprint key '{required}' is not declared in any section"
+            )
+
+    return problems
+
+
+def footprint_declares(footprint: Optional[Dict], key: str) -> bool:
+    """True when `key` appears in either footprint section."""
+    if not isinstance(footprint, dict):
+        return False
+    for section in FOOTPRINT_SECTIONS:
+        value = footprint.get(section)
+        if isinstance(value, (list, tuple)) and key in value:
+            return True
+    return False
+
+
+def assert_footprint_complete(
+    footprint: Optional[Dict],
+    required_keys: tuple = REQUIRED_CONTRACT_KEYS,
+) -> None:
+    """Raise :class:`FootprintError` describing every problem found.
+
+    Meant to be called immediately before submitting an envelope, so an
+    incomplete footprint is caught locally instead of costing a failed
+    submission and a ledger fee.
+    """
+    problems = inspect_footprint(footprint, required_keys)
+    if problems:
+        raise FootprintError("; ".join(problems))
+
 __all__ = [
     "RPCMonitor",
     "NodeMetrics",
@@ -605,4 +861,14 @@ __all__ = [
     "DEFAULT_CRITICAL_THRESHOLD",
     "DEFAULT_LATENCY_THRESHOLD_MS",
     "DEFAULT_SUCCESS_RATE_THRESHOLD",
+    "FlashLoanCircuitBreaker",
+    "FlashLoanObservation",
+    "FLASH_LOAN_BREAKER_THRESHOLD",
+    "FLASH_LOAN_POOL_SHARE_THRESHOLD",
+    "inspect_footprint",
+    "assert_footprint_complete",
+    "footprint_declares",
+    "FootprintError",
+    "FOOTPRINT_SECTIONS",
+    "REQUIRED_CONTRACT_KEYS",
 ]

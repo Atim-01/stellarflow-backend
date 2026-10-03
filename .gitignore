@@ -11,8 +11,8 @@ prisma/migrations/*
 !prisma/migrations/migration_lock.toml
 !prisma/migrations/20260827100000_add_harvest_executions/
 !prisma/migrations/20260827100000_add_harvest_executions/migration.sql
-!prisma/migrations/20260928000000_add_governance_result_export/
-!prisma/migrations/20260928000000_add_governance_result_export/migration.sql
+!prisma/migrations/20260929100000_add_sep31_metadata/
+!prisma/migrations/20260929100000_add_sep31_metadata/migration.sql
 docs/
 backups/
 .env
@@ -29,6 +29,7 @@ reports/
 
 # Rust / Soroban contract build artifacts
 contracts/target/
+native/shielded_merkle/target/
 
 # Generated load-test artifacts (k6 summaries, monitor CSVs, reports)
 tests/load/results/
