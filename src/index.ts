@@ -20,6 +20,7 @@ import {
   GasBalanceMonitorService,
   getGasBalanceMonitorService,
 } from "./services/gasBalanceMonitorService";
+import { getRelayerGasReserveAllocator } from "./services/relayerGasReserveAllocator";
 import { sanitizeEnvironmentVariables } from "./config/environment";
 import { validateEnv } from "./utils/envValidator";
 import { refreshAllowedOrigins } from "./middleware/corsMiddleware";
@@ -42,6 +43,8 @@ import { governanceWebhookBroadcaster } from "./services/governanceWebhookBroadc
 import { getRegionalHealthService } from "./services/regionalHealthService";
 import { storageRentBumpService } from "./services/storageRentBumpService";
 import { getOrderBookSnapshotEngine } from "./services/orderBookSnapshotEngine";
+import { systemHealthWatchdog } from "./services/systemHealthWatchdog";
+import { startAmmReserveDivergenceDetector } from "./services/ammReserveDivergenceDetector";
 import { redisOperationsWorker } from "./services/redisOperationsWorker";
 import { initializeBridgeServices, stopBridgeServices } from "./services/bridgeIntegration";
 import { VolatilityService } from "./services/volatility.service";
@@ -50,9 +53,8 @@ import { storageMonitorService } from "./services/storageMonitorService";
 import { complianceScreeningWorker } from "./services/complianceScreeningWorker";
 import { startDekRotationJob } from "./jobs/dekRotationJob";
 import { ledgerEventStreamWorker } from "./services/ledgerEventStreamWorker";
-import { taxReportExportWorker } from "./jobs/taxReportExportWorker";
-import { sorobanStateRootInspectorWorker } from "./services/sorobanStateRootInspectorWorker";
-import { systemHealthWatchdog } from "./services/systemHealthWatchdog";
+import { systemicRiskMonitor } from "./services/systemicRiskWiring";
+import { getEventBusService } from "./services/eventBus/eventBusService";
 
 // Load environment variables
 dotenv.config();
@@ -265,6 +267,7 @@ app.get("/", (req, res) => {
 const httpServer = createServer(app);
 initSocket(httpServer);
 const liquidityRebalancingWorker = startLiquidityRebalancingWorker();
+const ammReserveDivergenceDetector = startAmmReserveDivergenceDetector();
 let sorobanEventListener: SorobanEventListener | null = null;
 
 systemHealthWatchdog.registerWorker({
@@ -290,30 +293,29 @@ if (liquidityRebalancingWorker) {
   });
 }
 
-systemHealthWatchdog.registerWorker({
-  name: "soroban-state-root-inspector",
-  getLastHeartbeatAt: () => sorobanStateRootInspectorWorker.getLastHeartbeatAt(),
-  heartbeatTimeoutMs: sorobanStateRootInspectorWorker.getHeartbeatTimeoutMs(),
-  restart: () => {
-    sorobanStateRootInspectorWorker.stop();
-    sorobanStateRootInspectorWorker.start();
-  },
-});
-
-systemHealthWatchdog.registerWorker({
-  name: "tax-report-export",
-  getLastHeartbeatAt: () => taxReportExportWorker.getLastHeartbeatAt(),
-  heartbeatTimeoutMs: taxReportExportWorker.getHeartbeatTimeoutMs(),
-  restart: () => {
-    void taxReportExportWorker.stop();
-    taxReportExportWorker.start();
-  },
-});
+if (ammReserveDivergenceDetector) {
+  systemHealthWatchdog.registerWorker({
+    name: "amm-reserve-divergence-detector",
+    getLastHeartbeatAt: () => ammReserveDivergenceDetector.getLastHeartbeatAt(),
+    heartbeatTimeoutMs: ammReserveDivergenceDetector.getHeartbeatTimeoutMs(),
+    restart: () => {
+      ammReserveDivergenceDetector.stop();
+      ammReserveDivergenceDetector.start();
+    },
+  });
+}
 
 // FIX 1: Typed as nullable — constructor is not called at module level,
 // so a missing secret env var won't crash the process before the server starts.
 let gasBalanceMonitorService: GasBalanceMonitorService | null = null;
+// Issue #1058: relayer gas reserve allocator (opt-in via RELAYER_GAS_RESERVE_ENABLED).
+let relayerGasReserveAllocator: { stop(): void } | null = null;
 const circuitBreakerService = getCircuitBreakerService();
+
+// Issue #1055 – Event bus queue depth metrics + backpressure alert bot + worker
+// autoscaler. Constructed here (rather than at module level) so importing this
+// file does not open broker connections before the process is ready.
+const eventBusService = getEventBusService();
 
 let isShuttingDown = false;
 let stopEnvFileWatcher: (() => void) | undefined;
@@ -361,11 +363,17 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     governanceTimelockService.stop();
     governanceWebhookBroadcaster.stop();
     liquidityRebalancingWorker?.stop();
+    ammReserveDivergenceDetector?.stop();
     apyWorker.stop();
     storageMonitorService.stop(); // <--- ADDED
     systemHealthWatchdog.stop();
+systemicRiskMonitor.stop();
+    // Issue #1055 – stop the queue monitor before Redis/RabbitMQ go away so the
+    // final cycle is not a burst of failed probes.
+    await eventBusService.stop();
     // FIX 2: Optional chaining — safe to call even if service never started
     gasBalanceMonitorService?.stop();
+    relayerGasReserveAllocator?.stop();
     circuitBreakerService.stop();
     hourlyAverageService.stop();
     priceAggregatorService.stop();
@@ -377,6 +385,7 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     await taxReportExportWorker.stop();
     getOrderBookSnapshotEngine().stop();
     VolatilityService.stop();
+    DynamicFeeAdjusterService.stop();
     ArbitrageScanner.stop();
     stopConfigWatcher();
     stopEnvFileWatcher?.();
@@ -636,6 +645,21 @@ httpServer.listen(PORT, async () => {
     );
   }
 
+  // Relayer Gas Reserve Allocator (Issue #1058): holds back 20% of relayer gas
+  // wallets for emergency operations and monitors each pool's balance
+  // independently. Opt-in via RELAYER_GAS_RESERVE_ENABLED=true.
+  if (process.env.RELAYER_GAS_RESERVE_ENABLED === "true") {
+    getRelayerGasReserveAllocator()
+      .then(async (allocator) => {
+        relayerGasReserveAllocator = allocator;
+        await allocator.start();
+        console.log(`🛡️ Relayer gas reserve allocator started`);
+      })
+      .catch((err: Error) => {
+        console.error("Failed to start relayer gas reserve allocator:", err);
+      });
+  }
+
   // Invariant Violation Automated Circuit Breaker (Issue #829):
   // monitors balance invariants off-chain and auto-submits a pause()
   // transaction signed by the emergency keeper key when a CRITICAL breach
@@ -680,11 +704,37 @@ httpServer.listen(PORT, async () => {
     console.error("Failed to start volatility service:", err);
   }
 
+  // Start Dynamic Fee Adjuster
+  try {
+    DynamicFeeAdjusterService.start();
+  } catch (err) {
+    console.error("Failed to start dynamic fee adjuster:", err);
+  }
+
   // Start Arbitrage Scanner
   try {
     ArbitrageScanner.start();
   } catch (err) {
     console.error("Failed to start arbitrage scanner:", err);
+  }
+// Issue #978 – Multi-collateral vault systemic risk score engine
+  try {
+    systemicRiskMonitor.start();
+    console.log("📉 Systemic risk monitor started");
+  } catch (err) {
+    console.error("Failed to start systemic risk monitor:", err);
+  }
+
+  // Issue #1055 – Event bus queue depth metrics, backpressure alert bot and
+  // worker autoscaler. Started last so the first cycle observes a fully
+  // warmed-up ingestion path.
+  try {
+    eventBusService.start();
+    console.log(
+      `📊 Event bus monitor started (${eventBusService.getConfig().pollIntervalMs}ms interval, alert threshold ${eventBusService.getConfig().alert.threshold})`,
+    );
+  } catch (err) {
+    console.error("Failed to start event bus monitor:", err);
   }
 });
 
