@@ -25,6 +25,7 @@ export enum AlertType {
   VAULT_LIQUIDATION_RISK = "vault_liquidation_risk",
   SUPPLY_INVARIANT_DRIFT = "supply_invariant_drift",
   GOVERNANCE_TIMELOCK_READY = "governance_timelock_ready",
+  ORDER_CANCELLATION_ANOMALY = "order_cancellation_anomaly",
 }
 
 export interface SystemAlert {
