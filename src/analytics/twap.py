@@ -1,10 +1,5 @@
-from __future__ import annotations
-
-import hashlib
-import json
-import logging
-import threading
-from dataclasses import dataclass, field
+import math
+import numpy as np
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -183,11 +178,37 @@ class PostgresAuditLogger:
 default_audit_logger = PostgresAuditLogger()
 
 
-class TWAPEngine:
-    """Calculates Time-Weighted Average Price (TWAP) with outlier price spike suppression."""
+@dataclass
+class SwapLeg:
+    """A single child order in a Twap execution schedule."""
+    index: int
+    timestamp: datetime
+    asset_in: str
+    asset_out: str
+    amount_in: float
+    expected_price: float
+    expected_out: float
+    market_impact: float
+    gas_cost_eth: float
 
-    ROLLING_WINDOW_DEFAULT: timedelta = timedelta(hours=1)
-    Z_SCORE_THRESHOLD_DEFAULT: float = 3.0
+
+@dataclass
+class DiversificationPlan:
+    """Result of simulating a treasury diversification swap route."""
+    legs: List[SwapLeg]
+    total_amount_in: float
+    total_expected_out: float
+    average_market_impact: float
+    max_market_impact: float
+    total_gas_eth: float
+    total_gas_usd: float
+    gas_breakdown: Dict[str, float]
+    schedule_start: datetime
+    schedule_end: datetime
+
+
+class TWAPENgine:
+    """Calculates Time-Weighted Average Price (TWAP) with outlier filtering."""
 
     @staticmethod
     def calculate_z_score(
@@ -421,140 +442,239 @@ class TWAPEngine:
 
         return round(total_time_weighted_price / total_time_delta, 6)
 
-    @classmethod
-    def calculate_pool_twap(
-        cls,
-        pool_id: str,
-        samples: Sequence[Union[PriceSample, TradePoint]],
-        window: timedelta = ROLLING_WINDOW_DEFAULT,
-        current_time: Optional[datetime] = None,
-        z_threshold: float = Z_SCORE_THRESHOLD_DEFAULT,
-        audit_logger: Optional[PostgresAuditLogger] = None,
-    ) -> float:
-        """Calculate pool TWAP, suppressing outlier price spikes (|Z| > 3.0) and logging to PostgreSQL audit database.
 
-        Args:
-            pool_id: The liquidity pool identifier.
-            samples: Sequence of price samples or trade points.
-            window: Rolling window duration for TWAP calculation (default: 1 hour).
-            current_time: Reference timestamp (default: utcnow).
-            z_threshold: Z-score threshold for outlier suppression (default: 3.0).
-            audit_logger: Logger for suppressed outlier prices.
+class TreasuryDiversificationSimulator:
+    """Simulates market impact of multi-asset treasury diversification swaps.
 
-        Returns:
-            TWAP for the specified pool.
-        """
-        # Filter samples for this pool if pool_id is specified on samples
-        pool_samples = [
-            s for s in samples
-            if getattr(s, "pool_id", None) is None or getattr(s, "pool_id", None) == pool_id
-        ]
-
-        return cls.calculate_twap(
-            trades=pool_samples,
-            window=window,
-            current_time=current_time,
-            use_zscore_filter=True,
-            z_threshold=z_threshold,
-            audit_logger=audit_logger,
-            pool_id=pool_id,
-        )
-
-
-class RollingPoolTWAPTracker:
-    """Stateful rolling TWAP tracker for oracle feeds of a pool.
-
-    Maintains a rolling 1-hour window of clean price samples and automatically
-    suppresses outlier price spikes where |Z| > 3.0, logging them to PostgreSQL.
+    Splits large diversification swaps into Twap orders to minimize market impact
+    and outputs an execution schedule with an estimated gas cost breakdown.
     """
+
+    # Default liquidity depth factors (in USD) for common treasury assets.
+    DEFAULT_LIQUIDITY_DEPTH: Dict[str, float] = {
+        "USDT": 500_000_000.0,
+        "USDC": 200_000_000.0,
+        "DAI": 100_000_000.0,
+        "WBTC": 50_000_000.0,
+        "WETH": 50_000_000.0,
+        "STOSE": 5_000_000.0,
+        "ARB": 2_000_000.0,
+        "OP": 2_000_000.0,
+        "MATIC": 1_000_000.0,
+        "LARGE": 1_000_000.0,
+    }
+
+    # Default gas cost estimates (ETH) per swap leg by protocol.
+    DEFAULT_GAS_PER_LEG: Dict[str, float] = {
+        "uniswap_v2": 0.0015,
+        "uniswap_v3": 0.0025,
+        "curve": 0.0020,
+        "balancer": 0.0030,
+    }
+
+    # Default gas price in USD per ETH.
+    DEFAULT_GAS_PRICE_USD: float = 3000.0
 
     def __init__(
         self,
-        pool_id: str,
-        window: timedelta = TWAPEngine.ROLLING_WINDOW_DEFAULT,
-        z_threshold: float = TWAPEngine.Z_SCORE_THRESHOLD_DEFAULT,
-        audit_logger: Optional[PostgresAuditLogger] = None,
+        liquidity_depth: Optional[Dict[str, float]] = None,
+        gas_per_leg: Optional[Dict[str, float]] = None,
+        gas_price_usd: float = DEFAULT_GAS_PRICE_USD,
+        max_impact: float = 0.005,
     ) -> None:
-        self.pool_id = pool_id
-        self.window = window
-        self.z_threshold = z_threshold
-        self.audit_logger = audit_logger or default_audit_logger
-        self._clean_samples: List[PriceSample] = []
-        self._suppressed_records: List[OutlierAuditRecord] = []
-        self._lock = threading.Lock()
-
-    def add_sample(
-        self,
-        price: float,
-        timestamp: Optional[datetime] = None,
-        volume: float = 0.0,
-        feed_id: Optional[str] = None,
-        source: Optional[str] = None,
-    ) -> bool:
-        """Evaluate an incoming price sample.
-
-        Calculates Z-score against the rolling 1-hour window:
-        - If |Z| > 3.0: suppresses sample from TWAP and logs to PostgreSQL audit DB. Returns False.
-        - If |Z| <= 3.0: adds sample to rolling window. Returns True.
         """
-        ts = timestamp or datetime.now(timezone.utc)
-        sample = PriceSample(
-            timestamp=ts,
-            price=price,
-            volume=volume,
-            pool_id=self.pool_id,
-            feed_id=feed_id,
-            source=source,
-        )
+        Args:
+            liquidity_depth: Map of asset symbol -> available liquidity depth in USD.
+            gas_per_leg: Map of protocol -> gas cost in ETH per swap leg.
+            gas_price_usd: Price of one ETH in USD.
+            max_impact: Maximum acceptable market impact per leg (0.5% default).
+        """
+        self.liquidity_depth = dict(self.DEFAULT_LIQUIDITY_DEPTH)
+        if liquidity_depth:
+            self.liquidity_depth.update(liquidity_depth)
 
-        with self._lock:
-            # Evict samples older than window
-            cutoff = ts - self.window
-            self._clean_samples = [s for s in self._clean_samples if s.timestamp >= cutoff]
+        self.gas_per_leg = dict(self.DEFAULT_GAS_PER_LEG)
+        if gas_per_leg:
+            self.gas_per_leg.update(gas_per_leg)
 
-            window_prices = [s.price for s in self._clean_samples if s.timestamp < ts]
-            is_spike, z, mu, sigma = TWAPEngine.is_outlier(price, window_prices, threshold=self.z_threshold)
+        self.gas_price_usd = gas_price_usd
+        self.max_impact = max_impact
 
-            if is_spike:
-                record = OutlierAuditRecord(
-                    pool_id=self.pool_id,
-                    sample_price=price,
-                    z_score=z,
-                    mean=mu,
-                    std_dev=sigma,
-                    timestamp=ts,
-                    threshold=self.z_threshold,
-                    feed_id=feed_id,
-                    source=source,
-                    window_seconds=self.window.total_seconds(),
-                    reason=f"Outlier price spike detected: |Z|={abs(z):.4f} > {self.z_threshold}",
+    def _estimate_market_impact(self, amount_usd: float, asset: str, liquidity_depth_usd: Optional[float] = None) -> float:
+        """Estimates price impact for a swap using a constant-product like model."""
+        if amount_usd <= 0:
+            return 0.0
+
+        depth = liquidity_depth_usd
+        if depth is None:
+            depth = self.liquidity_depth.get(asset, 1_000_000.0)
+
+        if depth <= 0:
+            return 1.0
+
+        # Constant-product impact approximation: dx / (depth + dx)
+        impact = amount_usd / (depth + amount_usd)
+        return min(impact, 1.0)
+
+    def _choose_slice_count(
+        self,
+        total_amount_usd: float,
+        asset: str,
+        liquidity_depth_usd: Optional float = None,
+    ) -> int:
+        """Determines the minimum number of Twap slices to keep impact <= max_impact."""
+        if total_amount_usd <= 0:
+            return 1
+
+        depth = liquidity_depth_usd
+        if depth is None:
+            depth = self.liquidity_depth.get(asset, 1_000_000.0)
+
+        if depth <= 0:
+            return 1
+
+        # For constant-product, impact = x / (depth + x) <= max_impact
+        # x <= max_impact * depth / (1 - max_impact)
+        max_slice_usd = self.max_impact * depth / (1.0 - self.max_impact)
+        if max_slice_usd <= 0:
+            return 1
+
+        slices = int(math.ceil(total_amount_usd / max_slice_usd))
+        return max(slices, 1)
+
+    def simulate_diversification(
+        self,
+        amount_in: float,
+        asset_in: str,
+        target_allocations: Dict[str, float],
+        asset_prices: Dict[str, float],
+        duration_hours: float = 24.0,
+        num_slices: Optional[int] = None,
+        protocol: str = "uniswap_v3",
+        start_time: Optional[datetime] = None,
+        liquidity_depth_usd: Optional float = None,
+    ) -> DiversificationPlan:
+        """Simulates a multi-asset treasury diversification swap via Twap.
+
+        Args:
+            amount_in: Total amount of the input asset to swap.
+            asset_in: Symbol of the input asset.
+            target_allocations: Map of output asset -> fraction of total value (1.0).
+            asset_prices: Map of asset symbol -> USD price.
+            duration_hours: Duration of the Twap execution in hours.
+            num_slices: Explicit number of Twap slices. Auto-computed if None.
+            protocol: DEX/AGM protocol used for gas estimation.
+            start_time: Schedule start time. Defaults to now (UTC).
+            liquidity_depth_usd: Optional override for the input asset liquidity depth.
+
+        Returns:
+            DiversificationPlan with execution schedule and gas cost breakdown.
+        """
+        if amount_in <= 0:
+            raise ValueError("amount_in must be positive")
+        if not target_allocations:
+            raise ValueError("target_allocations must not be empty")
+        if asset_in not in asset_prices:
+            raise ValueError(f"missing price for input asset {asset_in}")
+
+        alloc_sum = sum(target_allocations.values())
+        if alloc_sum <= 0:
+            raise ValueError("target_allocations must sum to a positive value")
+
+        normalized_allocs = {k: v / alloc_sum for k, v in target_allocations.items()}
+
+        for asset in normalized_allocs:
+            if asset not in asset_prices:
+                raise ValueError(f"missing price for output asset {asset}")
+
+        if start_time is None:
+            start_time = datetime.now(timezone.utc)
+        elif start_time.tzinfo is None:
+            start_time = start_time.replace(tzinfo=timezone.utc)
+
+        if duration_hours <= 0:
+            raise ValueError("duration_hours must be positive")
+
+        price_in = asset_prices[asset_in]
+        total_value_usd = amount_in * price_in
+        depth_in = liquidity_depth_usd if liquidity_depth_usd is not None else self.liquidity_depth.get(asset_in, 1_000_000.0)
+
+        # Determine the number of Twap slices required to keep impact <= max_impact.
+        if num_slices is None:
+            num_slices = self._choose_slice_count(total_value_usd, asset_in, depth_in)
+        else:
+            num_slices = max(int(num_slices), 1)
+
+        slice_value_usd = total_value_usd / num_slices if num_slices else total_value_usd
+        slice_amount_in = amount_in / num_slices if num_slices else amount_in
+
+        gas_per_leg_eth = self.gas_per_leg.get(protocol, self.gas_per_leg["uniswap_v3"])
+        gas_price_usd = self.gas_price_usd
+
+        interval = timedelta(hours=duration_hours / num_slices)
+        legs: List[SwapLeg] = []
+        gas_breakdown: Dict[str, float] = {}
+        total_out = 0.0
+        total_impact = 0.0
+        max_impact = 0.0
+        leg_idx = 0
+
+        for slice_idx in range(num_slices):
+            slice_time = start_time + timedelta(hours=slice_idx * duration_hours / num_slices)
+            for asset_out, alloc in normalized_allocs.items():
+                if alloc <= 0:
+                    continue
+
+                amount_out_usd = slice_value_usd * alloc
+                if amount_out_usd <= 0:
+                    continue
+
+                price_out = asset_prices[asset_out]
+                if price_out <= 0:
+                    continue
+
+                depth_out = self.liquidity_depth.get(asset_out, 1_000_000.0)
+                impact_in = self._estimate_market_impact(amount_out_usd, asset_in, depth_in)
+                impact_out = self._estimate_market_impact(amount_out_usd, asset_out, depth_out)
+                leg_impact = min(impact_in + impact_out, 1.0)
+
+                amount_out = (amount_out_usd / price_out) * (1.0 - leg_impact)
+                amount_in_leg = slice_amount_in * alloc
+                gas_eth = gas_per_leg_eth
+
+                legs.append(
+                    SwapLeg(
+                        index=leg_idx,
+                        timestamp=slice_time,
+                        asset_in=asset_in,
+                        asset_out=asset_out,
+                        amount_in=amount_in_leg,
+                        expected_price=price_out,
+                        expected_out=amount_out,
+                        market_impact=leg_impact,
+                        gas_cost_eth=gas_eth,
+                    )
                 )
-                self._suppressed_records.append(record)
-                self.audit_logger.log_suppressed_sample(record)
-                return False
+                leg_idx += 1
+                total_out += amount_out
+                total_impact += leg_impact
+                max_impact = max(max_impact, leg_impact)
+                gas_breakdown[asset_out] = gas_breakdown.get(asset_out, 0.0) + gas_eth
 
-            self._clean_samples.append(sample)
-            return True
+        total_gas_eth = sum(gas_breakdown.values())
+        total_gas_usd = total_gas_eth * gas_price_usd
+        avg_impact = total_impact / len_legs if (len_legs := len(legs)) else 0.0
+        schedule_end = start_time + timedelta(hours=duration_hours)
 
-    def get_twap(self, current_time: Optional[datetime] = None) -> float:
-        """Compute the current pool TWAP over the rolling window using non-suppressed samples."""
-        with self._lock:
-            now = current_time or datetime.now(timezone.utc)
-            cutoff = now - self.window
-            active_clean = [s for s in self._clean_samples if s.timestamp >= cutoff]
-            return TWAPEngine.calculate_twap(
-                trades=active_clean,
-                window=self.window,
-                current_time=now,
-                use_zscore_filter=False,  # Already filtered upon ingestion
-            )
-
-    def get_clean_samples(self) -> List[PriceSample]:
-        """Return a copy of currently retained clean samples."""
-        with self._lock:
-            return list(self._clean_samples)
-
-    def get_suppressed_records(self) -> List[OutlierAuditRecord]:
-        """Return a copy of suppressed audit records."""
-        with self._lock:
-            return list(self._suppressed_records)
+        return DiversificationPlan(
+            legs=legs,
+            total_amount_in=amount_in,
+            total_expected_out=total_out,
+            average_market_impact=avg_impact,
+            max_market_impact=max_impact,
+            total_gas_eth=total_gas_eth,
+            total_gas_usd=total_gas_usd,
+            gas_breakdown=gas_breakdown,
+            schedule_start=start_time,
+            schedule_end=schedule_end,
+        )
