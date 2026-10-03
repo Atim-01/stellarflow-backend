@@ -53,6 +53,7 @@ import { storageMonitorService } from "./services/storageMonitorService";
 import { complianceScreeningWorker } from "./services/complianceScreeningWorker";
 import { startDekRotationJob } from "./jobs/dekRotationJob";
 import { ledgerEventStreamWorker } from "./services/ledgerEventStreamWorker";
+import { systemicRiskMonitor } from "./services/systemicRiskWiring";
 import { getEventBusService } from "./services/eventBus/eventBusService";
 
 // Load environment variables
@@ -366,6 +367,7 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     apyWorker.stop();
     storageMonitorService.stop(); // <--- ADDED
     systemHealthWatchdog.stop();
+systemicRiskMonitor.stop();
     // Issue #1055 – stop the queue monitor before Redis/RabbitMQ go away so the
     // final cycle is not a burst of failed probes.
     await eventBusService.stop();
@@ -696,6 +698,13 @@ httpServer.listen(PORT, async () => {
     ArbitrageScanner.start();
   } catch (err) {
     console.error("Failed to start arbitrage scanner:", err);
+  }
+// Issue #978 – Multi-collateral vault systemic risk score engine
+  try {
+    systemicRiskMonitor.start();
+    console.log("📉 Systemic risk monitor started");
+  } catch (err) {
+    console.error("Failed to start systemic risk monitor:", err);
   }
 
   // Issue #1055 – Event bus queue depth metrics, backpressure alert bot and
