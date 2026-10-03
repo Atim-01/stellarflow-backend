@@ -32,6 +32,7 @@ import priceUpdatesRouter from "./routes/priceUpdates";
 import sanityCheckRouter from "./routes/sanityCheck";
 import statsRouter from "./routes/stats";
 import statusRouter from "./routes/status";
+import poolsRouter from "./routes/pools";
 import systemControlRouter from "./routes/systemControl";
 import systemFailoverRouter from "./routes/systemFailover";
 import analyticsRouter from "./routes/analytics";
@@ -93,6 +94,9 @@ app.use(tracingMiddleware);
 app.use(axiosTracingMiddleware);
 
 app.use("/health", healthRouter);
+
+// Issue #1040 – SEP-01 stellar.toml metadata served from the well-known path.
+app.use("/.well-known", stellarTomlRouter);
 
 app.use("/api/v1/docs", swaggerUi.serve);
 
@@ -164,6 +168,7 @@ app.use("/api/v1/intelligence", intelligenceRouter);
 app.use("/api/v1/price-updates", priceUpdatesRouter);
 app.use("/api/v1/assets", assetsRouter);
 app.use("/api/v1/status", statusRouter);
+app.use("/api/v1/pools", poolsRouter);
 app.use("/api/v1/derived-assets", derivedAssetsRouter);
 app.use("/api/v1/sanity-check", sanityCheckRouter);
 app.use("/api/v1/cache", cacheMetricsRouter);
@@ -199,6 +204,15 @@ app.use("/api/v1/sep24", sep24InitiationRouter);
 
 // Issue #1046 – Yield Farming Token Emission Schedule Calculator
 app.use("/api/v1/yield", yieldEmissionRouter);
+
+// Issue #1003 – Dynamic vault collateral valuation factors
+app.use("/api/v1/risk", riskRouter);
+
+// Issue #1067 – Soroban state root inspection status
+app.use("/api/v1/security", securityRouter);
+
+// Issue #1009 – Tax-compliant user transaction history exports
+app.use("/api/v1/users", taxReportRouter);
 
 // Issue #836 – Soroban Contract Instruction & Storage Rent Estimator
 // eslint-disable-next-line no-undef

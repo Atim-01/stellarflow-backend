@@ -54,7 +54,7 @@ import { storageMonitorService } from "./services/storageMonitorService";
 import { complianceScreeningWorker } from "./services/complianceScreeningWorker";
 import { startDekRotationJob } from "./jobs/dekRotationJob";
 import { ledgerEventStreamWorker } from "./services/ledgerEventStreamWorker";
-import { marketStreamAggregator } from "./services/marketStreamAggregator";
+import { systemicRiskMonitor } from "./services/systemicRiskWiring";
 import { getEventBusService } from "./services/eventBus/eventBusService";
 
 // Load environment variables
@@ -369,6 +369,7 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     apyWorker.stop();
     storageMonitorService.stop(); // <--- ADDED
     systemHealthWatchdog.stop();
+systemicRiskMonitor.stop();
     // Issue #1055 – stop the queue monitor before Redis/RabbitMQ go away so the
     // final cycle is not a burst of failed probes.
     await eventBusService.stop();
@@ -382,7 +383,8 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     storageRentBumpService.stop();
     redisOperationsWorker.stop();
     complianceScreeningWorker.stop();
-    marketStreamAggregator.stop();
+    sorobanStateRootInspectorWorker.stop();
+    await taxReportExportWorker.stop();
     getOrderBookSnapshotEngine().stop();
     VolatilityService.stop();
     DynamicFeeAdjusterService.stop();
@@ -490,6 +492,22 @@ httpServer.listen(PORT, async () => {
 
   complianceScreeningWorker.start();
   console.log(`🛡️ Compliance screening worker started`);
+
+  // Issue #1067 – Verify off-chain Merkle state against Soroban ledger roots
+  try {
+    sorobanStateRootInspectorWorker.start();
+    console.log(`🛡️ Soroban state root inspector worker started`);
+  } catch (err) {
+    console.error("Failed to start Soroban state root inspector worker:", err);
+  }
+
+  // Issue #1009 – Background tax report export worker
+  try {
+    taxReportExportWorker.start();
+    console.log(`🧾 Tax report export worker started`);
+  } catch (err) {
+    console.error("Failed to start tax report export worker:", err);
+  }
 
   // Start PostgreSQL storage footprint monitor (Issue #813)
   try {
@@ -744,6 +762,13 @@ httpServer.listen(PORT, async () => {
     ArbitrageScanner.start();
   } catch (err) {
     console.error("Failed to start arbitrage scanner:", err);
+  }
+// Issue #978 – Multi-collateral vault systemic risk score engine
+  try {
+    systemicRiskMonitor.start();
+    console.log("📉 Systemic risk monitor started");
+  } catch (err) {
+    console.error("Failed to start systemic risk monitor:", err);
   }
 
   // Issue #1055 – Event bus queue depth metrics, backpressure alert bot and
