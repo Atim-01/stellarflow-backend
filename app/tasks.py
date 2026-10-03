@@ -42,6 +42,23 @@ def poll_anchor_settlement_statuses(self: DatabaseTask) -> int:
     return asyncio.run(AnchorStatusPoller().poll_once())
 
 
+@celery_app.task(
+    bind=True,
+    base=DatabaseTask,
+    name="app.tasks.monitor_fiat_settlement_latency",
+    autoretry_for=(OSError, asyncpg.PostgresError),
+    retry_backoff=True,
+    max_retries=3,
+)
+def monitor_fiat_settlement_latency(self: DatabaseTask, lookback_hours: int = 24) -> Dict[str, Any]:
+    """Monitor fiat settlement latency across regional anchors, deactivate >4h, and re-route."""
+    from app.services.fiat_settlement import DatabaseSettlementLatencyWorker
+    database_url = DatabaseTask._database_url or os.getenv("DATABASE_URL") or os.getenv("DB_URL")
+    worker = DatabaseSettlementLatencyWorker(database_url=database_url)
+    return asyncio.run(worker.run_evaluation_cycle(lookback_hours=lookback_hours))
+
+
+
 async def _aggregate(granularity: str, cutoff: datetime) -> int:
     database_url = DatabaseTask._database_url
     if not database_url:

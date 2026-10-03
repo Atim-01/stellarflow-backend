@@ -70,6 +70,11 @@ celery_app.conf.update(
             "task": "app.tasks.poll_anchor_settlement_statuses",
             "schedule": 30.0,
         },
+        "monitor-fiat-settlement-latency": {
+            "task": "app.tasks.monitor_fiat_settlement_latency",
+            "schedule": crontab(minute="*/5"),
+            "kwargs": {"lookback_hours": 24},
+        },
         "aggregate-minute-analytics": {
             "task": "app.tasks.aggregate_ledger_analytics",
             "schedule": crontab(minute="*/5"),
