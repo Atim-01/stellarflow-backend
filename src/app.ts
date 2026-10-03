@@ -94,6 +94,9 @@ app.use(axiosTracingMiddleware);
 
 app.use("/health", healthRouter);
 
+// Issue #1040 – SEP-01 stellar.toml metadata served from the well-known path.
+app.use("/.well-known", stellarTomlRouter);
+
 app.use("/api/v1/docs", swaggerUi.serve);
 
 app.get(
@@ -200,6 +203,15 @@ app.use("/api/v1/sep24", sep24InitiationRouter);
 
 // Issue #1046 – Yield Farming Token Emission Schedule Calculator
 app.use("/api/v1/yield", yieldEmissionRouter);
+
+// Issue #1003 – Dynamic vault collateral valuation factors
+app.use("/api/v1/risk", riskRouter);
+
+// Issue #1067 – Soroban state root inspection status
+app.use("/api/v1/security", securityRouter);
+
+// Issue #1009 – Tax-compliant user transaction history exports
+app.use("/api/v1/users", taxReportRouter);
 
 // Issue #836 – Soroban Contract Instruction & Storage Rent Estimator
 // eslint-disable-next-line no-undef

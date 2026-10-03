@@ -381,6 +381,8 @@ systemicRiskMonitor.stop();
     storageRentBumpService.stop();
     redisOperationsWorker.stop();
     complianceScreeningWorker.stop();
+    sorobanStateRootInspectorWorker.stop();
+    await taxReportExportWorker.stop();
     getOrderBookSnapshotEngine().stop();
     VolatilityService.stop();
     DynamicFeeAdjusterService.stop();
@@ -444,6 +446,22 @@ httpServer.listen(PORT, async () => {
 
   complianceScreeningWorker.start();
   console.log(`🛡️ Compliance screening worker started`);
+
+  // Issue #1067 – Verify off-chain Merkle state against Soroban ledger roots
+  try {
+    sorobanStateRootInspectorWorker.start();
+    console.log(`🛡️ Soroban state root inspector worker started`);
+  } catch (err) {
+    console.error("Failed to start Soroban state root inspector worker:", err);
+  }
+
+  // Issue #1009 – Background tax report export worker
+  try {
+    taxReportExportWorker.start();
+    console.log(`🧾 Tax report export worker started`);
+  } catch (err) {
+    console.error("Failed to start tax report export worker:", err);
+  }
 
   // Start PostgreSQL storage footprint monitor (Issue #813)
   try {
